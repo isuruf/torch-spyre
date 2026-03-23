@@ -279,7 +279,26 @@ PYBIND11_MODULE(_C, m) {
       .def(py::init<std::vector<int64_t>, std::vector<int32_t>,
                     std::vector<int64_t>, DataFormats>(),
            py::arg("device_size"), py::arg("dim_map"), py::arg("stride_map"),
-           py::arg("device_dtype"));
+           py::arg("device_dtype"))
+      .def(py::pickle(
+           [](const spyre::SpyreTensorLayout &p) { // __getstate__
+               /* Return a tuple that fully encodes the state of the object */
+               return py::make_tuple(
+	           p.device_size,
+		   p.dim_map,
+		   p.stride_map,
+		   p.device_dtype);
+           },
+           [](py::tuple t) { // __setstate__
+               if (t.size() != 4)
+                   throw std::runtime_error("Invalid state!");
+               return spyre::SpyreTensorLayout(
+	           t[0].cast<std::vector<int64_t>>(),
+	           t[1].cast<std::vector<int32_t>>(),
+	           t[2].cast<std::vector<int64_t>>(),
+		   t[3].cast<DataFormats>()
+	       );
+           }));
 
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
   m.def("to_with_layout", &spyre::to_with_layout);
