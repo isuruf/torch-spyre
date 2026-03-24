@@ -282,16 +282,21 @@ PYBIND11_MODULE(_C, m) {
            py::arg("device_dtype"))
       .def(py::pickle(
           [](const spyre::SpyreTensorLayout &p) {  // __getstate__
-            /* Return a tuple that fully encodes the state of the object */
-            return py::make_tuple(p.device_size, p.dim_map, p.stride_map,
-                                  p.device_dtype);
+            // Return a tuple that fully encodes the state of the object
+            // If the pickle format changes, then update
+            // stl_pickle_layout_version but keep the tuple as the returned
+            // object and the first element to be the stl_pickle_layout_version
+            int32_t stl_pickle_layout_version = 1;
+            return py::make_tuple(stl_pickle_layout_version, p.device_size,
+                                  p.dim_map, p.stride_map, p.device_dtype);
           },
           [](py::tuple t) {  // __setstate__
-            if (t.size() != 4) throw std::runtime_error("Invalid state!");
-            return spyre::SpyreTensorLayout(t[0].cast<std::vector<int64_t>>(),
-                                            t[1].cast<std::vector<int32_t>>(),
-                                            t[2].cast<std::vector<int64_t>>(),
-                                            t[3].cast<DataFormats>());
+            if (t.size() != 5 || t[0].cast<std::vector<int32_t>>() != 1)
+              throw std::runtime_error("Invalid state!");
+            return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
+                                            t[2].cast<std::vector<int32_t>>(),
+                                            t[3].cast<std::vector<int64_t>>(),
+                                            t[4].cast<DataFormats>());
           }));
 
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
