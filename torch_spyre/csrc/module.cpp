@@ -291,7 +291,7 @@ PYBIND11_MODULE(_C, m) {
                                   p.dim_map, p.stride_map, p.device_dtype);
           },
           [](py::tuple t) {  // __setstate__
-            if (t.size() != 5 || t[0].cast<std::vector<int32_t>>() != 1)
+            if (t.size() != 5 || t[0].cast<int32_t>() != 1)
               throw std::runtime_error("Invalid state!");
             return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
                                             t[2].cast<std::vector<int32_t>>(),
