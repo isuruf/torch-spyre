@@ -101,11 +101,11 @@ class TestSpyreTensorLayout(TestCase):
         self.assertNotEqual(y, z)
 
     def test_stl_pickleable(self):
-        stl = SpyreTensorLayout([512, 256], torch.float16, [1, 0])
+        stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
         self.assertEqual(stl, pickle.loads(pickle.dumps(stl)))
 
     def test_stl_copyable(self):
-        stl = SpyreTensorLayout([512, 256], torch.float16, [1, 0])
+        stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
         self.assertEqual(stl, copy.deepcopy(stl))
 
     def test_to_spyre_layout(self):
