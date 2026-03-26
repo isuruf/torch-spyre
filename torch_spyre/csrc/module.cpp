@@ -289,7 +289,7 @@ PYBIND11_MODULE(_C, m) {
             // kSpyreTensorLayoutPickleVersion but keep the tuple as the
             // returned object and the first element to be the
             // kSpyreTensorLayoutPickleVersion
-            return py::make_tuple(kSpyreTensorLayoutPickleVersion,
+            return py::make_tuple(spyre::kSpyreTensorLayoutPickleVersion,
                                   p.device_size, p.dim_map, p.stride_map,
                                   p.device_dtype);
           },
@@ -300,7 +300,7 @@ PYBIND11_MODULE(_C, m) {
             }
 
             int32_t version = t[0].cast<int32_t>();
-            if (version != kSpyreTensorLayoutPickleVersion) {
+            if (version != spyre::kSpyreTensorLayoutPickleVersion) {
               throw py::value_error(
                   "Unsupported SpyreTensorLayout pickle version: " +
                   std::to_string(version));
