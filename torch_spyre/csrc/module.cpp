@@ -48,6 +48,8 @@
 
 namespace spyre {
 
+static constexpr int32_t kSpyreTensorLayoutPickleVersion = 1;
+
 std::atomic<bool> g_downcast_warn_enabled{true};
 
 bool get_downcast_warn_enabled() {
@@ -284,15 +286,26 @@ PYBIND11_MODULE(_C, m) {
           [](const spyre::SpyreTensorLayout &p) {  // __getstate__
             // Return a tuple that fully encodes the state of the object
             // If the pickle format changes, then update
-            // stl_pickle_layout_version but keep the tuple as the returned
-            // object and the first element to be the stl_pickle_layout_version
-            int32_t stl_pickle_layout_version = 1;
-            return py::make_tuple(stl_pickle_layout_version, p.device_size,
-                                  p.dim_map, p.stride_map, p.device_dtype);
+            // kSpyreTensorLayoutPickleVersion but keep the tuple as the
+            // returned object and the first element to be the
+            // kSpyreTensorLayoutPickleVersion
+            return py::make_tuple(kSpyreTensorLayoutPickleVersion,
+                                  p.device_size, p.dim_map, p.stride_map,
+                                  p.device_dtype);
           },
           [](py::tuple t) {  // __setstate__
-            if (t.size() != 5 || t[0].cast<int32_t>() != 1)
-              throw std::runtime_error("Invalid state!");
+            if (t.size() != 5) {
+              throw py::value_error(
+                  "Invalid SpyreTensorLayout pickle: wrong tuple size");
+            }
+
+            int32_t version = t[0].cast<int32_t>();
+            if (version != kSpyreTensorLayoutPickleVersion) {
+              throw py::value_error(
+                  "Unsupported SpyreTensorLayout pickle version: " +
+                  std::to_string(version));
+            }
+
             return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
                                             t[2].cast<std::vector<int32_t>>(),
                                             t[3].cast<std::vector<int64_t>>(),
