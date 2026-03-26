@@ -212,6 +212,7 @@ def _autoload():
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
+    import torch_spyre.tensor  # noqa: F401
     import torch_spyre.codegen_ops  # noqa: F401
     from torch_spyre._inductor import _light_autoload
 
