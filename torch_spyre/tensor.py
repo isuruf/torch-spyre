@@ -153,14 +153,14 @@ class SpyreTensor(torch.Tensor):
 
 
 def wrap_spyre_tensor(x):
-    if os.environ.get("TORCH_SPYRE_WRAPPER_SUBCLASS", "0") == "0":
+    if os.environ.get("TORCH_SPYRE_WRAPPER_SUBCLASS", "1") == "0":
         return x
     else:
         return SpyreTensor(x)
 
 
 def wrap_spyre_tensor_args(*args, **kwargs):
-    if os.environ.get("TORCH_SPYRE_WRAPPER_SUBCLASS", "0") == "0":
+    if os.environ.get("TORCH_SPYRE_WRAPPER_SUBCLASS", "1") == "0":
         return args, kwargs
 
     def wrap(x):
