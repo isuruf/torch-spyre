@@ -31,14 +31,14 @@ class SpyreTensor(torch.Tensor):
                 and orig_layout is not None
                 and device_tensor_layout != orig_layout
             ):
-                t = to_with_layout(t, device_tensor_layout)._t
+                t = to_with_layout(t, device_tensor_layout)
         else:
             if device_tensor_layout is None:
                 device_tensor = t.to("spyre")
                 device_tensor_layout = device_tensor.device_tensor_layout()
                 t = device_tensor._t
             else:
-                t = to_with_layout(t, device_tensor_layout)._t
+                t = to_with_layout(t, device_tensor_layout)
         assert not isinstance(t, SpyreTensor)
         self._t = t
         self._stl = device_tensor_layout or orig_layout
@@ -71,9 +71,13 @@ class SpyreTensor(torch.Tensor):
         if (
             device_layout is None
         ):  # use original implementation if no layout is provided
-            return SpyreTensor(self._t.to(*args, **kwargs))
+            result = self._t.to(*args, **kwargs)
+            if result.device.type == "spyre":
+                return SpyreTensor(result)
+            else:
+                return result
         else:
-            return to_with_layout(self, device_layout)
+            return SpyreTensor(to_with_layout(self, device_layout))
 
     @classmethod
     def empty(
@@ -100,7 +104,7 @@ class SpyreTensor(torch.Tensor):
                     out=out,
                     dtype=dtype,
                     layout=layout,
-                    device=device,
+                    device=device or "spyre",
                     requires_grad=requires_grad,
                     pin_memory=pin_memory,
                     memory_format=memory_format,
@@ -134,21 +138,28 @@ class SpyreTensor(torch.Tensor):
     def __torch_dispatch__(cls, func, types, args, kwargs):
         if kwargs is None:
             kwargs = {}
-        args_a = pytree.tree_map(
-            lambda x: x._t if isinstance(x, SpyreTensor) else x, args
-        )
-        kwargs_a = pytree.tree_map(
-            lambda x: x._t if isinstance(x, SpyreTensor) else x, kwargs
-        )
+        spyre_tensors = {}
+
+        def unwrap(x):
+            if isinstance(x, SpyreTensor):
+                spyre_tensors[id(x._t)] = x
+                return x._t
+            else:
+                return x
+
+        def wrap(x):
+            if isinstance(x, torch.Tensor) and x.device.type == "spyre":
+                found = spyre_tensors.get(id(x))
+                if found is not None:
+                    return found
+                else:
+                    return SpyreTensor(x)
+            return x
+
+        args_a = pytree.tree_map(unwrap, args)
+        kwargs_a = pytree.tree_map(unwrap, kwargs)
         out_a = func(*args_a, **kwargs_a)
-        out = pytree.tree_map(
-            lambda x: (
-                SpyreTensor(x)
-                if isinstance(x, torch.Tensor) and x.device.type == "spyre"
-                else x
-            ),
-            out_a,
-        )
+        out = pytree.tree_map(wrap, out_a)
         return out
 
 
