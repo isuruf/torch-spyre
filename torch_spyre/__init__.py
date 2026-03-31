@@ -159,6 +159,7 @@ def make_spyre_module() -> types.ModuleType:
             "current_stream",
             "default_stream",
             "synchronize",
+            "SpyreTensor",
         }:
             impl._lazy_init()
             from torch_spyre.streams import (
@@ -168,6 +169,7 @@ def make_spyre_module() -> types.ModuleType:
                 default_stream,
                 synchronize,
             )
+            from torch_spyre.tensor import SpyreTensor
 
             streams_map = {
                 "Stream": Stream,
@@ -175,6 +177,7 @@ def make_spyre_module() -> types.ModuleType:
                 "current_stream": current_stream,
                 "default_stream": default_stream,
                 "synchronize": synchronize,
+                "SpyreTensor": SpyreTensor,
             }
             return streams_map[name]
         if hasattr(impl._C, name):
