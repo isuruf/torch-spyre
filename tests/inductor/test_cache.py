@@ -14,24 +14,32 @@
 
 import unittest
 import torch
-from torch._inductor.utils import fresh_cache, clear_caches
+from torch._inductor.utils import fresh_cache
 from torch._dynamo.utils import counters
 
 
 class TestCache(unittest.TestCase):
     def test_cache(self):
+        a = torch.randn((64, 64)).to("spyre")
+        fn = torch.compile(torch.abs, dynamic=False)
         with fresh_cache():
-            x = torch.randn((64, 64)).to("spyre")
-            cfn = torch.compile(torch.abs, dynamic=False)
-
-            cfn(x)
-            artifacts = torch.compiler.save_cache_artifacts()
-            self.assertIsNotNone(artifacts)
+            result = fn(a)
             self.assertEqual(counters["inductor"]["fxgraph_cache_miss"], 1)
+            self.assertEqual(counters["inductor"]["fxgraph_cache_hit"], 0)
 
-            artifact_bytes, cache_info = artifacts
-            torch._dynamo.reset()
-            clear_caches()
+        artifacts = torch.compiler.save_cache_artifacts()
 
-            cfn(x)
+        self.assertFalse(torch.compiler._cache.CacheArtifactManager.need_serialize())
+        self.assertIsNotNone(artifacts)
+
+        artifact_bytes, cache_info = artifacts
+
+        torch._dynamo.reset()
+
+        with fresh_cache():
+            torch.compiler.load_cache_artifacts(artifact_bytes)
+            result = fn(a)
+            self.assertEqual(counters["inductor"]["fxgraph_cache_miss"], 1)
             self.assertEqual(counters["inductor"]["fxgraph_cache_hit"], 1)
+
+        self.assertFalse(torch.compiler._cache.CacheArtifactManager.need_serialize())
