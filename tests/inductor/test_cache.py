@@ -20,6 +20,7 @@ from torch._dynamo.utils import counters
 
 class TestCache(unittest.TestCase):
     def test_cache(self):
+        counters.clear()
         a = torch.randn((64, 64)).to("spyre")
         fn = torch.compile(torch.abs, dynamic=False)
         with fresh_cache():
