@@ -24,7 +24,7 @@ class TestCache(unittest.TestCase):
         a = torch.randn((64, 64)).to("spyre")
         fn = torch.compile(torch.abs, dynamic=False)
         with fresh_cache():
-            result = fn(a)
+            fn(a)
             self.assertEqual(counters["inductor"]["fxgraph_cache_miss"], 1)
             self.assertEqual(counters["inductor"]["fxgraph_cache_hit"], 0)
 
@@ -39,7 +39,7 @@ class TestCache(unittest.TestCase):
 
         with fresh_cache():
             torch.compiler.load_cache_artifacts(artifact_bytes)
-            result = fn(a)
+            fn(a)
             self.assertEqual(counters["inductor"]["fxgraph_cache_miss"], 1)
             self.assertEqual(counters["inductor"]["fxgraph_cache_hit"], 1)
 
