@@ -15,6 +15,7 @@
 from typing import Optional, Sequence
 import torch
 from torch_spyre.ops.fallbacks import warn_fallback
+from torch_spyre.codegen_ops import compile_once
 
 from .errors import Unsupported
 
@@ -210,14 +211,13 @@ def _ones_scalar_fake(
 @torch.library.custom_op(
     "spyre::copy_from_d2d", mutates_args=("dst",), device_types="spyre"
 )
+@compile_once("spyre.copy_from_d2d", dynamic=False)
 def copy_from_d2d(
     src: torch.Tensor,
     dst: torch.Tensor,
+    compiled = None
 ) -> None:
-    _compiled_copy_from_d2d = torch.compile(
-        torch.ops.spyre.copy_from_d2d, dynamic=False
-    )
-    return _compiled_copy_from_d2d(src, dst)
+    return compiled(src, dst)
 
 
 @copy_from_d2d.register_fake
