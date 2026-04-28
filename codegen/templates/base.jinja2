@@ -13,6 +13,7 @@
   See the License for the specific language governing permissions and
   limitations under the License.
 #}
+{% if scalar_arg_names|length > 0 %}
 @torch.library.register_kernel("aten::{{ template_data.reg_name | replace('"', '')}}", ["spyre"])
 @compile_once({{ template_data.torch_prefix }}.{{ template_data.torch_func_name }}, dynamic=False)
 def spyre__{{ template_data.op_name }}({{ signature_in }}, compiled=None){% if returns|length > 0 %} -> {{ signature_out }}{% endif %}:
@@ -30,3 +31,6 @@ def spyre__{{ template_data.op_name }}({{ signature_in }}, compiled=None){% if r
     # Standard variant
     return compiled({{ arg_names }})
     {% endif %}
+{% else %}
+register_torch_compile_kernel("aten::{{ template_data.reg_name | replace('"', '')}}", {{ template_data.torch_prefix }}.{{ template_data.torch_func_name }})
+{% endif %}
