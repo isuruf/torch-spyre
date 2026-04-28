@@ -14,11 +14,15 @@
 
 import torch
 import torch_spyre.ops.fallbacks  # noqa: F401
+from torch_spyre.ops.fallbacks import register_fallback as _register_fallback  # noqa: F401
 import torch_spyre._C as _C
 import warnings
 import functools
 import inspect
 import operator
+
+
+aten = torch.ops.aten
 
 
 # Decorator to keep track of compiled variant
@@ -53,6 +57,10 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
     if dim < 0:
         return dim + ndims
     return dim
+
+
+def register_fallback(op):
+    _regsiter_fallback(op)(op)
 
 
 def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
