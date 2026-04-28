@@ -60,7 +60,9 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
 
 
 def register_fallback(op):
-    _regsiter_fallback(op)(op)
+    if isinstance(op, torch._ops.OpOverloadPacket):
+        op = op.default
+    _register_fallback([op.name()])(op)
 
 
 def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
