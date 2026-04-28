@@ -40,7 +40,7 @@ def compile_once(op, **compile_kwargs):
         # a clean signature.
         old_signature = inspect.signature(fn)
         params = dict(old_signature.parameters)
-        params.pop("compiled")
+        params.pop("compiled", None)
         new_signature = old_signature.replace(parameters=params.values())
         wrapper.__signature__ = new_signature
 
@@ -55,18 +55,19 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
     return dim
 
 
-@torch.library.register_kernel("aten::mm", ["spyre"])  # type:ignore
-@compile_once(torch.mm, dynamic=False)
-def spyre__mm(self: torch.Tensor, mat2: torch.Tensor, compiled) -> torch.Tensor:
-    return compiled(self, mat2)
+def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
+    return compiled(*args, **kwargs)
 
 
-@torch.library.register_kernel("aten::mm.out", ["spyre"])  # type:ignore
-@compile_once(torch.mm, dynamic=False)
-def spyre__mm_out(
-    self: torch.Tensor, mat2: torch.Tensor, out: torch.Tensor, compiled
-) -> torch.Tensor:
-    return compiled(self, mat2, out=out)
+def register_torch_compile_kernel(aten_op, torch_op):
+    compiled_op = compile_once(torch_op, dynamic=False)(dispatch_to_torch_compile)
+    torch.library.register_kernel(aten_op, "spyre"])(compiled_op)
+
+
+register_torch_compile_kernel("aten::mm", torch.mm)
+register_torch_compile_kernel("aten::mm.out", torch.mm)
+register_torch_compile_kernel("aten::silu.out", torch.ops.aten.silu.out)
+#register_torch_compile_kernel("aten::mishu.out", torch.ops.aten.mishu.out)
 
 
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
@@ -100,24 +101,6 @@ def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
     self.copy_(tmp)
     # TODO: Can we zero out tensors in-place without copy
     return self
-
-
-@torch.library.register_kernel("aten::silu.out", ["spyre"])  # type:ignore
-@compile_once(torch.ops.aten.silu.out, dynamic=False)
-def spyre__silu_out(
-    self: torch.Tensor, out: torch.Tensor = None, compiled=None
-) -> torch.Tensor:
-    # Out variant
-    return compiled(self, out=out)
-
-
-@torch.library.register_kernel("aten::mish.out", ["spyre"])  # type:ignore
-@compile_once(torch.ops.aten.mish.out, dynamic=False)
-def spyre__mish_out(
-    self: torch.Tensor, out: torch.Tensor = None, compiled=None
-) -> torch.Tensor:
-    # Out variant
-    return compiled(self, out=out)
 
 
 @torch.library.register_kernel("aten::uniform_", "spyre")  # type:ignore
