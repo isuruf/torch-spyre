@@ -59,15 +59,17 @@ def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
     return compiled(*args, **kwargs)
 
 
-def register_torch_compile_kernel(aten_op, torch_op):
-    compiled_op = compile_once(torch_op, dynamic=False)(dispatch_to_torch_compile)
-    torch.library.register_kernel(aten_op, "spyre"])(compiled_op)
+def register_torch_compile_kernel(aten_op):
+    if isinstance(aten_op, torch._ops.OpOverloadPacket):
+        aten_op = aten_op.default
+    compiled_op = compile_once(aten_op, dynamic=False)(dispatch_to_torch_compile)
+    torch.library.register_kernel(aten_op.name(), ["spyre"])(compiled_op)
 
 
-register_torch_compile_kernel("aten::mm", torch.mm)
-register_torch_compile_kernel("aten::mm.out", torch.mm)
-register_torch_compile_kernel("aten::silu.out", torch.ops.aten.silu.out)
-#register_torch_compile_kernel("aten::mishu.out", torch.ops.aten.mishu.out)
+register_torch_compile_kernel(aten.mm)
+register_torch_compile_kernel(aten.mm.out)
+register_torch_compile_kernel(aten.silu.out)
+#register_torch_compile_kernel(aten.mishu.out)
 
 
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore

@@ -13,4 +13,4 @@
   See the License for the specific language governing permissions and
   limitations under the License.
 #}
-register_torch_compile_kernel("aten::{{ template_data.reg_name | replace('"', '')}}", {{ template_data.torch_prefix }}.{{ template_data.torch_func_name }})
+register_torch_compile_kernel(aten.{{ template_data.reg_name | replace('"', '')}})
