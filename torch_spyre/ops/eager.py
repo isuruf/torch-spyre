@@ -79,7 +79,7 @@ def register_torch_compile_kernel(aten_op):
 register_torch_compile_kernel(aten.mm)
 register_torch_compile_kernel(aten.mm.out)
 register_torch_compile_kernel(aten.silu.out)
-#register_torch_compile_kernel(aten.mishu.out)
+# register_torch_compile_kernel(aten.mishu.out)
 
 
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
