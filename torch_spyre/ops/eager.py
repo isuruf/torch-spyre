@@ -108,6 +108,7 @@ register_torch_compile_kernel(
     [
         aten.mm,
         aten.silu.out,
+        aten.mish.out,
         aten.abs,
         aten.add,
         aten.bitwise_not,
