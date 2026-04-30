@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import torch
-import torch.utils._pytree as pytree
+from torch._ops import OpOverload, OpOverloadPacket
 import torch_spyre.ops.fallbacks  # noqa: F401
 from torch_spyre.ops.fallbacks import register_fallback  # noqa: F401
 import torch_spyre._C as _C
@@ -21,6 +21,8 @@ import warnings
 import functools
 import inspect
 import operator
+
+from typing import Union
 
 
 aten = torch.ops.aten
@@ -60,18 +62,36 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
     return dim
 
 
-def register_cpu_fallback_kernel(ops):
-    def register(op):
+def _get_op_overloads(
+    ops: Union[OpOverloadPacket, OpOverload, list[Union[OpOverload, OpOverloadPacket]]],
+) -> list[OpOverload]:
+    result = []
+    if isinstance(ops, list):
+        for op in ops:
+            result.extend(_get_op_overloads(op))
+        return result
+
+    if isinstance(ops, OpOverloadPacket):
+        result.extend([getattr(ops, op) for op in ops.overloads()])
+    else:
+        result.append(ops)
+
+    def _filter_out(op):
         if "Tensor" not in str(op._schema):
             # there are some ops that do not take in Tensors
             # like aten.sum.int
-            return
+            return False
         if "dtype" in op.name():
             # ops that change dtype are not supported yet
-            return
-        register_fallback([op.name()])(op)
+            return False
+        return True
 
-    pytree.tree_map(register, ops)
+    return list(filter(_filter_out, result))
+
+
+def register_cpu_fallback_kernel(ops):
+    for op in _get_op_overloads(ops):
+        register_fallback([op.name()])(op)
 
 
 def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
@@ -79,18 +99,9 @@ def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
 
 
 def register_torch_compile_kernel(ops):
-    def register(op):
-        if "Tensor" not in str(op._schema):
-            # there are some ops that do not take in Tensors
-            # like aten.sum.int
-            return
-        if "dtype" in op.name():
-            # ops that change dtype are not supported yet
-            return
+    for op in _get_op_overloads(ops):
         compiled_kernel = compile_once(op, dynamic=False)(dispatch_to_torch_compile)
         torch.library.register_kernel(op.name(), ["spyre"])(compiled_kernel)
-
-    pytree.tree_map(register, ops)
 
 
 register_torch_compile_kernel(
