@@ -198,11 +198,11 @@ if __name__ == "__main__":
     else:
         from torch.utils.cpp_extension import BuildExtension, CppExtension
 
-        OUTPUT_CODEGEN_DIR = run_codegen()
+        # OUTPUT_CODEGEN_DIR = run_codegen()
 
         sources = list(CSRC_DIR.glob("*.cpp"))
-        if OUTPUT_CODEGEN_DIR:
-            sources += list(OUTPUT_CODEGEN_DIR.glob("*.cpp"))
+        # if OUTPUT_CODEGEN_DIR:
+        #     sources += list(OUTPUT_CODEGEN_DIR.glob("*.cpp"))
 
         # Filenames that belong to the tiny hooks module.
         # "shared" files are compiled into both _hooks.so and _C.so.

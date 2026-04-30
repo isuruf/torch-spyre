@@ -234,7 +234,7 @@ def spyre__cos(input, **kwargs):
 # Manually append to fallback_ops: register_fallback cannot be used here because
 # normal_ is an in-place op — register_fallback is designed for out-of-place ops
 # and would leave the original Spyre tensor unfilled.
-# The kernel itself is registered in ops.py (and therefore codegen_ops.py).
+# The kernel itself is registered in ops.py.
 fallback_ops.append(aten.normal_.default)
 
 

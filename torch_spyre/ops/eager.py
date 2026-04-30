@@ -13,8 +13,9 @@
 # limitations under the License.
 
 import torch
+import torch.utils._pytree as pytree
 import torch_spyre.ops.fallbacks  # noqa: F401
-from torch_spyre.ops.fallbacks import register_fallback as _register_fallback  # noqa: F401
+from torch_spyre.ops.fallbacks import register_fallback  # noqa: F401
 import torch_spyre._C as _C
 import warnings
 import functools
@@ -59,27 +60,82 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
     return dim
 
 
-def register_fallback(op):
-    if isinstance(op, torch._ops.OpOverloadPacket):
-        op = op.default
-    _register_fallback([op.name()])(op)
+def register_cpu_fallback_kernel(ops):
+    def register(op):
+        if "Tensor" not in str(op._schema):
+            # there are some ops that do not take in Tensors
+            # like aten.sum.int
+            return
+        if "dtype" in op.name():
+            # ops that change dtype are not supported yet
+            return
+        register_fallback([op.name()])(op)
+
+    pytree.tree_map(register, ops)
 
 
 def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
     return compiled(*args, **kwargs)
 
 
-def register_torch_compile_kernel(aten_op):
-    if isinstance(aten_op, torch._ops.OpOverloadPacket):
-        aten_op = aten_op.default
-    compiled_op = compile_once(aten_op, dynamic=False)(dispatch_to_torch_compile)
-    torch.library.register_kernel(aten_op.name(), ["spyre"])(compiled_op)
+def register_torch_compile_kernel(ops):
+    def register(op):
+        if "Tensor" not in str(op._schema):
+            # there are some ops that do not take in Tensors
+            # like aten.sum.int
+            return
+        if "dtype" in op.name():
+            # ops that change dtype are not supported yet
+            return
+        compiled_kernel = compile_once(op, dynamic=False)(dispatch_to_torch_compile)
+        torch.library.register_kernel(op.name(), ["spyre"])(compiled_kernel)
+
+    pytree.tree_map(register, ops)
 
 
-register_torch_compile_kernel(aten.mm)
-register_torch_compile_kernel(aten.mm.out)
-register_torch_compile_kernel(aten.silu.out)
-# register_torch_compile_kernel(aten.mishu.out)
+register_torch_compile_kernel(
+    [
+        aten.mm,
+        aten.silu.out,
+        aten.abs,
+        aten.add,
+        aten.bitwise_not,
+        aten.logical_not,
+        aten.bmm,
+        aten.cat,
+        aten.div,
+        aten.exp,
+        aten.log,
+        aten.mean,
+        aten.mul,
+        aten.reciprocal,
+        aten.neg,
+        aten.relu,
+        aten.rsqrt,
+        aten.sigmoid,
+        aten._softmax,
+        aten.stack,
+        aten.sum,
+        aten.sqrt,
+        aten.tanh,
+        aten.sub,
+        aten.addmm,
+        aten.eq,
+        aten.ge,
+        aten.gt,
+        aten.lt,
+        aten.maximum,
+        aten.pow,
+        aten.linalg_vector_norm,
+    ]
+)
+
+register_cpu_fallback_kernel(
+    [
+        aten.cumsum,
+        aten.repeat.out,
+    ]
+)
 
 
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore

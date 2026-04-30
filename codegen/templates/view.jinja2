@@ -13,4 +13,4 @@
   See the License for the specific language governing permissions and
   limitations under the License.
 #}
-register_fallback(aten.{{ template_data.reg_name | replace('"', '')}})
+register_cpu_fallback_kernel(aten.{{ template_data.reg_name | replace('"', '')}})
