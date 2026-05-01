@@ -65,6 +65,13 @@ def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
 
 def register_torch_compile_kernel(ops):
     for op in _get_op_overloads(ops):
+        if "Tensor" not in str(op._schema):
+            # there are some ops that do not take in Tensors
+            # like aten.sum.int
+            continue
+        if "dtype" in op.name():
+            # ops that change dtype are not supported yet
+            continue
         compiled_kernel = compile_once(op, dynamic=False)(dispatch_to_torch_compile)
         torch.library.register_kernel(op.name(), ["spyre"])(compiled_kernel)
 

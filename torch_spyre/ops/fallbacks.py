@@ -95,17 +95,7 @@ def _get_op_overloads(
     else:
         result.append(ops)
 
-    def _filter_out(op):
-        if "Tensor" not in str(op._schema):
-            # there are some ops that do not take in Tensors
-            # like aten.sum.int
-            return False
-        if "dtype" in op.name():
-            # ops that change dtype are not supported yet
-            return False
-        return True
-
-    return list(filter(_filter_out, result))
+    return result
 
 
 def register_fallback(ops, device="cpu"):
@@ -246,9 +236,6 @@ def register_fallback_default(ops):
 
 register_fallback_default(
     [
-        aten.arange.default,
-        aten.arange.start,
-        aten.arange.start_step,
         aten.sin,
         aten.cos,
         aten.embedding.default,
@@ -262,6 +249,11 @@ register_fallback_default(
         aten.repeat.out,
     ]
 )
+
+
+@register_fallback([aten.arange.default, aten.arange.start, aten.arange.start_step])
+def spyre__arange(*args, **kwargs):
+    return torch.arange(*args, **kwargs)
 
 
 @register_fallback([aten.arange.out, aten.arange.start_out])
