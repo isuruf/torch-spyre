@@ -89,11 +89,6 @@ def _get_op_overloads(
     return list(filter(_filter_out, result))
 
 
-def register_cpu_fallback_kernel(ops):
-    for op in _get_op_overloads(ops):
-        register_fallback([op.name()])(op)
-
-
 def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
     return compiled(*args, **kwargs)
 
@@ -139,13 +134,6 @@ register_torch_compile_kernel(
         aten.maximum,
         aten.pow,
         aten.linalg_vector_norm,
-    ]
-)
-
-register_cpu_fallback_kernel(
-    [
-        aten.cumsum,
-        # aten.repeat.out,
     ]
 )
 
