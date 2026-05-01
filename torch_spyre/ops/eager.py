@@ -145,7 +145,7 @@ register_torch_compile_kernel(
 register_cpu_fallback_kernel(
     [
         aten.cumsum,
-        aten.repeat.out,
+        # aten.repeat.out,
     ]
 )
 
