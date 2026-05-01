@@ -49,7 +49,9 @@ import os
 import warnings
 
 import torch
-from .eager import _get_op_overloads
+from torch._ops import OpOverload, OpOverloadPacket
+
+from typing import Union
 
 aten = torch._ops.ops.aten
 
@@ -77,6 +79,33 @@ def warn_fallback(op, fallback_device="cpu"):
         category=FallbackWarning,
         skip_file_prefixes=_warn_skips,
     )
+
+
+def _get_op_overloads(
+    ops: Union[OpOverloadPacket, OpOverload, list[Union[OpOverload, OpOverloadPacket]]],
+) -> list[OpOverload]:
+    result = []
+    if isinstance(ops, list):
+        for op in ops:
+            result.extend(_get_op_overloads(op))
+        return result
+
+    if isinstance(ops, OpOverloadPacket):
+        result.extend([getattr(ops, op) for op in ops.overloads()])
+    else:
+        result.append(ops)
+
+    def _filter_out(op):
+        if "Tensor" not in str(op._schema):
+            # there are some ops that do not take in Tensors
+            # like aten.sum.int
+            return False
+        if "dtype" in op.name():
+            # ops that change dtype are not supported yet
+            return False
+        return True
+
+    return list(filter(_filter_out, result))
 
 
 def register_fallback(ops, device="cpu"):
@@ -222,7 +251,7 @@ register_fallback_default(
         aten.arange.start_step,
         aten.sin,
         aten.cos,
-        aten.embeding.default,
+        aten.embedding.default,
         aten.isin,
         aten.tril,
         aten.triu,

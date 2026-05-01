@@ -13,16 +13,13 @@
 # limitations under the License.
 
 import torch
-from torch._ops import OpOverload, OpOverloadPacket
 import torch_spyre.ops.fallbacks  # noqa: F401
-from torch_spyre.ops.fallbacks import register_fallback  # noqa: F401
+from .fallbacks import _get_op_overloads
 import torch_spyre._C as _C
 import warnings
 import functools
 import inspect
 import operator
-
-from typing import Union
 
 
 aten = torch.ops.aten
@@ -60,33 +57,6 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
     if dim < 0:
         return dim + ndims
     return dim
-
-
-def _get_op_overloads(
-    ops: Union[OpOverloadPacket, OpOverload, list[Union[OpOverload, OpOverloadPacket]]],
-) -> list[OpOverload]:
-    result = []
-    if isinstance(ops, list):
-        for op in ops:
-            result.extend(_get_op_overloads(op))
-        return result
-
-    if isinstance(ops, OpOverloadPacket):
-        result.extend([getattr(ops, op) for op in ops.overloads()])
-    else:
-        result.append(ops)
-
-    def _filter_out(op):
-        if "Tensor" not in str(op._schema):
-            # there are some ops that do not take in Tensors
-            # like aten.sum.int
-            return False
-        if "dtype" in op.name():
-            # ops that change dtype are not supported yet
-            return False
-        return True
-
-    return list(filter(_filter_out, result))
 
 
 def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
