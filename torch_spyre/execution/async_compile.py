@@ -12,14 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import tempfile
 from collections.abc import Sequence
 from typing import Any
-import os
 import subprocess
 import torch
 
-from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
     LoopSpec,
@@ -28,16 +25,10 @@ from torch_spyre._inductor.op_spec import (
     find_unimplemented,
 )
 from torch_spyre._inductor.codegen.bundle import generate_bundle
+from torch_spyre.execution.compile_cache import get_spyre_cache
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
-
-
-def get_output_dir(kernel_name: str):
-    spyre_dir = os.path.join(cache_dir(), "inductor-spyre")
-    os.makedirs(spyre_dir, exist_ok=True)
-    kernel_output_dir = tempfile.mkdtemp(dir=spyre_dir, prefix=f"{kernel_name}_")
-    return kernel_output_dir
 
 
 class SpyreAsyncCompile:
@@ -47,6 +38,7 @@ class SpyreAsyncCompile:
     def sdsc(
         self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
     ):
+        cache = get_spyre_cache()
         unimp = find_unimplemented(list(specs))
         if unimp is not None:
             logger.warning(
@@ -54,13 +46,16 @@ class SpyreAsyncCompile:
             )
             return SpyreUnimplementedRunner(kernel_name, unimp.op)
 
-        # Generate SDSC Bundle from OpSpecs
-        output_dir = get_output_dir(kernel_name)
-        generate_bundle(kernel_name, output_dir, specs)
+        op_specs = [s for s in specs if isinstance(s, (OpSpec, LoopSpec))]
 
-        # Invoke backend compiler of SDSC Bundle
-        with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
-            subprocess.run(["dxp_standalone", "-d", output_dir], check=True)
+        output_dir, cache_found = cache.try_load(op_specs)
+        if not cache_found:
+            # Generate SDSC Bundle from OpSpecs
+            generate_bundle(kernel_name, output_dir, op_specs)
+            # Invoke backend compiler of SDSC Bundle
+            with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
+                subprocess.run(["dxp_standalone", "-d", output_dir], check=True)
+            convert_artifacts(output_dir)
 
         return SpyreSDSCKernelRunner(kernel_name, output_dir)
 
