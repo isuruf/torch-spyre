@@ -247,7 +247,7 @@ def _is_topk(op: str) -> bool:
 
 def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
     if is_matmul:
-        return MATMUL_DIM_LABELS[5 - ndim :]
+        return MATMUL_DIM_LABELS[len(MATMUL_DIM_LABELS) - ndim :]
     return INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
 
 
@@ -475,7 +475,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     )
 
 
-def compile_op_spec(kernel_name: str, op_spec: OpSpec) -> Any:
+def compile_op_spec(idx: int, op_spec: OpSpec) -> Any:
     sdsc_spec = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
-    return generate_sdsc(sdsc_spec)
+    return generate_sdsc(idx, sdsc_spec)

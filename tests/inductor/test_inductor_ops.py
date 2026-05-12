@@ -29,11 +29,16 @@ POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
     "cos": torch.cos,
     "exp": torch.exp,
+    "floor": torch.floor,
     "neg": torch.neg,
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
     "sin": torch.sin,
     "tanh": torch.tanh,
+}
+
+POINTWISE_UNARY_OPS_FP32_DICT = {
+    "floor": torch.floor,
 }
 
 POINTWISE_BINARY_OPS_DICT = {
@@ -305,7 +310,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # 0D / scalar tensor
                 "scalar_tensor": (None, torch.tensor(5.0, dtype=torch.float16)),
             },
-            "expect_fail": ["scalar_tensor"],
         },
         ("test_amax_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": {"amax": torch.amax},
@@ -1014,6 +1018,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 4, 8, 64), dtype=torch.float16),
                     cached_randn((2, 4, 12, 64), dtype=torch.float16),
                 ),
+                "4d_dim2_zero": (
+                    2,
+                    cached_randn((0)),
+                    cached_randn((1, 8, 14, 64), dtype=torch.float16),
+                ),
                 "4d_dim3": (
                     3,
                     cached_randn((2, 4, 8, 64), dtype=torch.float16),
@@ -1023,6 +1032,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     3,
                     cached_randn((2, 4, 3, 64), dtype=torch.float32),
                     cached_randn((2, 4, 3, 32), dtype=torch.float32),
+                ),
+                "4d_dim_m2_empty_first": (
+                    -2,
+                    torch.zeros(0, dtype=torch.float16),
+                    cached_randn((1, 8, 14, 64), dtype=torch.float16),
                 ),
             },
         },
@@ -2968,6 +2982,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp32_4d_dim_3",
             ],
         },
+        (
+            "test_pointwise_unary_op_fp32",
+            "test_unary_op",
+        ): {
+            "ops_dict": POINTWISE_UNARY_OPS_FP32_DICT,
+            "param_sets": {
+                "256": (cached_randn((256,), dtype=torch.float32),),
+                "67x256": (cached_randn((67, 256), dtype=torch.float32),),
+                "67x71x256": (cached_randn((67, 71, 256), dtype=torch.float32),),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -2985,6 +3010,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
             tiny_value_mask = torch.abs(x) < FP16_EPS
             x[tiny_value_mask] = FP16_EPS
+        elif op == torch.floor:
+            # To avoid cpu mismatch due to a negative fp16 having a fraction 0b0000000001
+            x = x.to("spyre").cpu()
 
         self.compare_with_cpu(op, x)
 
@@ -3123,6 +3151,394 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # aten::topk is not registered for Spyre eager dispatch.
         self.compare_with_cpu(
             lambda x: torch.topk(x, k, dim=dim)[0], x, run_eager=False
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support the integer index tensor in "
+            "torch.min(dim) tuple outputs yet (stable error signature: "
+            "Unsupported: operation on DataFormats.IEEE_INT32)"
+        ),
+        strict=True,
+    )
+    def test_min_tuple_output_keepdim0_known_xfail(self):
+        x = unique_randn_along_dim((5, 7), dim=1)
+        self.compare_with_cpu(
+            lambda x: torch.min(x, dim=1, keepdim=False),
+            x,
+            run_eager=False,
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support integer index outputs from "
+            "argmin yet (stable error signature: Unsupported: operation on "
+            "DataFormats.IEEE_INT32)"
+        ),
+        strict=True,
+    )
+    def test_argmin_keepdim0_known_xfail(self):
+        x = unique_randn_along_dim((5, 7), dim=1)
+        self.compare_with_cpu(
+            lambda x: torch.argmin(x, dim=1, keepdim=False),
+            x,
+            run_eager=False,
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.count_nonzero on "
+            "floating inputs yet (stable error signature: Unsupported: "
+            "unexpected argument Constant(value=0.0, dtype=torch.float16) to "
+            "notequal)"
+        ),
+        strict=True,
+    )
+    def test_count_nonzero_float_dim0_known_xfail(self):
+        x = cached_randn((67, 256))
+        self.compare_with_cpu(
+            lambda x: torch.count_nonzero(x, dim=0),
+            x,
+            run_eager=False,
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.count_nonzero on "
+            "bool inputs yet (stable error signature: Unsupported: unexpected "
+            "argument PointwiseOp(op='to_dtype', ...) to reduction lowering)"
+        ),
+        strict=True,
+    )
+    def test_count_nonzero_bool_dim0_known_xfail(self):
+        x = torch.tensor(
+            [
+                [True, False, True, False, True, False, True],
+                [False, False, True, True, False, True, False],
+                [True, True, False, False, True, False, False],
+                [False, True, False, True, False, True, True],
+                [True, False, False, True, True, False, True],
+            ],
+            dtype=torch.bool,
+        )
+        self.compare_with_cpu(
+            lambda x: torch.count_nonzero(x, dim=0),
+            x,
+            run_eager=False,
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend hits an internal lowering bug for "
+            "torch.logsumexp (stable error signature: InductorError: "
+            "IndexError: list index out of range)"
+        ),
+        strict=True,
+    )
+    def test_logsumexp_keepdim0_known_xfail(self):
+        x = cached_randn((67, 256), scale=0.1)
+        self.compare_with_cpu(
+            lambda x: torch.logsumexp(x, dim=0, keepdim=False),
+            x,
+            run_eager=False,
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend hits an internal lowering bug for "
+            "torch.nanmean (stable error signature: InductorError: IndexError: "
+            "list index out of range)"
+        ),
+        strict=True,
+    )
+    def test_nanmean_all_dims_known_xfail(self):
+        x = torch.tensor(
+            [
+                [float("nan"), 1.0, -2.0, 3.0],
+                [4.0, float("nan"), -5.0, 6.0],
+                [7.0, 8.0, float("nan"), -9.0],
+            ],
+            dtype=torch.float32,
+        )
+        self.compare_with_cpu(lambda x: torch.nanmean(x), x, run_eager=False)
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend hits an internal lowering bug for "
+            "torch.nansum (stable error signature: InductorError: IndexError: "
+            "list index out of range)"
+        ),
+        strict=True,
+    )
+    def test_nansum_all_dims_known_xfail(self):
+        x = torch.tensor(
+            [
+                [float("nan"), 1.0, -2.0, 3.0],
+                [4.0, float("nan"), -5.0, 6.0],
+                [7.0, 8.0, float("nan"), -9.0],
+            ],
+            dtype=torch.float32,
+        )
+        self.compare_with_cpu(lambda x: torch.nansum(x), x, run_eager=False)
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.all yet (stable "
+            "error signature: InductorError: AttributeError: "
+            "'UnimplementedOp' object has no attribute 'iteration_space')"
+        ),
+        strict=True,
+    )
+    def test_all_dim0_known_xfail(self):
+        x = torch.tensor(
+            [
+                [True, False, True, False],
+                [True, True, False, False],
+                [False, True, True, False],
+            ],
+            dtype=torch.bool,
+        )
+        self.compare_with_cpu(
+            lambda x: torch.all(x, dim=0, keepdim=False), x, run_eager=False
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.any yet (stable "
+            "error signature: InductorError: AttributeError: "
+            "'UnimplementedOp' object has no attribute 'iteration_space')"
+        ),
+        strict=True,
+    )
+    def test_any_dim0_known_xfail(self):
+        x = torch.tensor(
+            [
+                [True, False, True, False],
+                [True, True, False, False],
+                [False, True, True, False],
+            ],
+            dtype=torch.bool,
+        )
+        self.compare_with_cpu(
+            lambda x: torch.any(x, dim=0, keepdim=False), x, run_eager=False
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.prod yet (stable "
+            "error signature: InductorError: AttributeError: "
+            "'UnimplementedOp' object has no attribute 'iteration_space')"
+        ),
+        strict=True,
+    )
+    def test_prod_dim0_known_xfail(self):
+        x = cached_randn((67, 256), scale=0.1)
+        self.compare_with_cpu(
+            lambda x: torch.prod(x, dim=0, keepdim=False), x, run_eager=False
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.std yet (stable "
+            "error signature: InductorError: TypeError: "
+            "'UnimplementedOp' object is not subscriptable)"
+        ),
+        strict=True,
+    )
+    def test_std_dim0_known_xfail(self):
+        x = cached_randn((67, 256), dtype=torch.float32)
+        self.compare_with_cpu(
+            lambda x: torch.std(x, dim=0, keepdim=False), x, run_eager=False
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.var yet (stable "
+            "error signature: InductorError: TypeError: "
+            "'UnimplementedOp' object is not subscriptable)"
+        ),
+        strict=True,
+    )
+    def test_var_dim0_known_xfail(self):
+        x = cached_randn((67, 256), dtype=torch.float32)
+        self.compare_with_cpu(
+            lambda x: torch.var(x, dim=0, keepdim=False), x, run_eager=False
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.std_mean yet "
+            "(stable error signature: InductorError: TypeError: "
+            "'UnimplementedOp' object is not subscriptable)"
+        ),
+        strict=True,
+    )
+    def test_std_mean_dim0_known_xfail(self):
+        x = cached_randn((67, 256), dtype=torch.float32)
+        self.compare_with_cpu(
+            lambda x: torch.std_mean(x, dim=0, keepdim=False), x, run_eager=False
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.var_mean yet "
+            "(stable error signature: InductorError: TypeError: "
+            "'UnimplementedOp' object is not subscriptable)"
+        ),
+        strict=True,
+    )
+    def test_var_mean_dim0_known_xfail(self):
+        x = cached_randn((67, 256), dtype=torch.float32)
+        self.compare_with_cpu(
+            lambda x: torch.var_mean(x, dim=0, keepdim=False), x, run_eager=False
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.cumprod yet "
+            "(stable error signature: NotImplementedError: Could not run "
+            "'aten::cumprod.out' with arguments from the 'spyre' backend)"
+        ),
+        strict=True,
+    )
+    def test_cumprod_dim0_known_xfail(self):
+        x = cached_randn((67, 256), scale=0.1)
+        self.compare_with_cpu(lambda x: torch.cumprod(x, dim=0), x, run_eager=False)
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.logcumsumexp yet "
+            "(stable error signature: NotImplementedError: Could not run "
+            "'aten::_logcumsumexp' with arguments from the 'spyre' backend)"
+        ),
+        strict=True,
+    )
+    def test_logcumsumexp_dim0_known_xfail(self):
+        x = cached_randn((67, 256), scale=0.1)
+        self.compare_with_cpu(
+            lambda x: torch.logcumsumexp(x, dim=0), x, run_eager=False
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.cummax yet "
+            "(stable error signature: NotImplementedError: Could not run "
+            "'aten::_cummax_helper' with arguments from the 'spyre' backend)"
+        ),
+        strict=True,
+    )
+    def test_cummax_dim0_known_xfail(self):
+        x = unique_randn_along_dim((67, 256), dim=0)
+        self.compare_with_cpu(lambda x: torch.cummax(x, dim=0), x, run_eager=False)
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.cummin yet "
+            "(stable error signature: NotImplementedError: Could not run "
+            "'aten::_cummin_helper' with arguments from the 'spyre' backend)"
+        ),
+        strict=True,
+    )
+    def test_cummin_dim0_known_xfail(self):
+        x = unique_randn_along_dim((67, 256), dim=0)
+        self.compare_with_cpu(lambda x: torch.cummin(x, dim=0), x, run_eager=False)
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.quantile yet "
+            "(stable error signature: InductorError: Unsupported: unexpected "
+            "argument PointwiseOp(op='to_dtype', ...) to mul)"
+        ),
+        strict=True,
+    )
+    def test_quantile_q050_dim0_known_xfail(self):
+        x = cached_randn((67, 256), dtype=torch.float32)
+        self.compare_with_cpu(
+            lambda x: torch.quantile(x, 0.5, dim=0, keepdim=False),
+            x,
+            run_eager=False,
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.nanquantile yet "
+            "(stable error signature: InductorError: IndexError: list index "
+            "out of range)"
+        ),
+        strict=True,
+    )
+    def test_nanquantile_q050_dim0_known_xfail(self):
+        x = torch.tensor(
+            [
+                [float("nan"), 1.0, -2.0, 3.0],
+                [4.0, float("nan"), -5.0, 6.0],
+                [7.0, 8.0, float("nan"), -9.0],
+                [2.0, 3.0, 4.0, 5.0],
+            ],
+            dtype=torch.float32,
+        )
+        self.compare_with_cpu(
+            lambda x: torch.nanquantile(x, 0.5, dim=0, keepdim=False),
+            x,
+            run_eager=False,
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.median yet "
+            "(stable error signature: NotImplementedError: Could not run "
+            "'aten::median.dim_values' with arguments from the 'spyre' backend)"
+        ),
+        strict=True,
+    )
+    def test_median_dim1_known_xfail(self):
+        x = unique_randn_along_dim((67, 71, 256), dim=1)
+        self.compare_with_cpu(
+            lambda x: torch.median(x, dim=1, keepdim=False), x, run_eager=False
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.nanmedian yet "
+            "(stable error signature: NotImplementedError: Could not run "
+            "'aten::median.dim_values' with arguments from the 'spyre' backend)"
+        ),
+        strict=True,
+    )
+    def test_nanmedian_dim0_known_xfail(self):
+        x = torch.tensor(
+            [
+                [float("nan"), 1.0, -2.0, 3.0],
+                [4.0, float("nan"), -5.0, 6.0],
+                [7.0, 8.0, float("nan"), -9.0],
+            ],
+            dtype=torch.float32,
+        )
+        self.compare_with_cpu(
+            lambda x: torch.nanmedian(x, dim=0, keepdim=False),
+            x,
+            run_eager=False,
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.mode yet "
+            "(stable error signature: NotImplementedError: Could not run "
+            "'aten::mode' with arguments from the 'spyre' backend)"
+        ),
+        strict=True,
+    )
+    def test_mode_dim1_known_xfail(self):
+        x = torch.tensor(
+            [
+                [0.0, 0.0, 2.0, 3.0],
+                [1.0, 1.0, 4.0, 5.0],
+                [2.0, 2.0, 6.0, 7.0],
+            ],
+            dtype=torch.float16,
+        )
+        self.compare_with_cpu(
+            lambda x: torch.mode(x, dim=1, keepdim=False), x, run_eager=False
         )
 
     def test_max_sub_broadcast(self, dim: int, x):
