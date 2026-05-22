@@ -14,6 +14,7 @@
 
 import os
 import sys
+from typing import Literal
 
 from torch.utils._config_module import install_config_module
 
@@ -39,5 +40,14 @@ sencores: int = int(os.getenv("SENCORES", "32"))
 core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
+
+
+# Layout solver class used by default in scratchpad.allocator.DefaultAllocator.
+# Options:
+#  "greedy":   GreedyLayoutSolver,
+#  "bestfit":  BestFitLayoutSolver,
+#  "firstfit": FirstFitLayoutSolver (default).
+
+layout_solver: Literal["greedy", "bestfit", "firstfit"] = "firstfit"
 
 install_config_module(sys.modules[__name__])
