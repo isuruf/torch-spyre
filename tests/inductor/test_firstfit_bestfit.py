@@ -22,6 +22,7 @@ import torch  # noqa: F401
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     BestFitLayoutSolver,
     FirstFitLayoutSolver,
+    _assert_in_place_relationships,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
@@ -98,6 +99,48 @@ class LayoutSolverTests(BaseClass):
         )
 
 
+def _inplace_buf(name: str, size: int, start: int, end: int, parents: list[str]):
+    return LifetimeBoundBuffer(name, size, start, end, in_place_parents=parents)
+
+
+class InPlaceSolverTests(LayoutSolverTests):
+    """In-place reuse tests shared by both solver subclasses."""
+
+    def test_child_reuses_parent_address(self):
+        # P ends at 5; C.start_time=4 == P.end_time - 1, so in-place is valid.
+        # Without in-place, P's [0,20) would be subtracted and C would land at 20.
+        p = LifetimeBoundBuffer("P", 20, 0, 5)
+        c = _inplace_buf("C", 15, 4, 9, ["P"])
+        result = self.solve([p, c])
+        by_name = {b.name: b.address for b in result}
+        self.assertEqual(by_name["P"], 0)
+        self.assertEqual(by_name["C"], 0)
+
+    def test_child_evicted_when_parent_evicted(self):
+        # P is too large to fit; C declared as in-place child of P.
+        # P gets evicted (address=None), so C also cannot in-place and
+        # must fall back to normal placement.
+        p = LifetimeBoundBuffer("P", 200, 0, 5)
+        c = _inplace_buf("C", 15, 4, 9, ["P"])
+        result = self.solve([p, c], size=100)
+        by_name = {b.name: b.address for b in result}
+        self.assertIsNone(by_name["P"])
+        # C can still be placed independently (no overlap conflict with evicted P).
+        self.assertEqual(by_name["C"], 0)
+
+    def test_assert_rejects_wrong_end_time(self):
+        p = LifetimeBoundBuffer("P", 20, 0, 5)
+        c = _inplace_buf("C", 15, 3, 9, ["P"])  # start_time=3, need P.end_time==4
+        with self.assertRaises(AssertionError):
+            _assert_in_place_relationships([p, c])
+
+    def test_assert_rejects_oversized_child(self):
+        p = LifetimeBoundBuffer("P", 10, 0, 5)
+        c = _inplace_buf("C", 15, 4, 9, ["P"])  # child larger than parent
+        with self.assertRaises(AssertionError):
+            _assert_in_place_relationships([p, c])
+
+
 def _two_gap_buffers():
     """Buffers that leave two free gaps for x in a 120-byte scratchpad.
 
@@ -120,7 +163,7 @@ def _two_gap_buffers():
     ]
 
 
-class TestFirstFitLayoutSolver(LayoutSolverTests, TestCase):
+class TestFirstFitLayoutSolver(InPlaceSolverTests, TestCase):
     solver_class = FirstFitLayoutSolver
 
     def test_picks_first_gap_not_tightest(self):
@@ -129,7 +172,7 @@ class TestFirstFitLayoutSolver(LayoutSolverTests, TestCase):
         self.assertEqual(x_addr, 0)
 
 
-class TestBestFitLayoutSolver(LayoutSolverTests, TestCase):
+class TestBestFitLayoutSolver(InPlaceSolverTests, TestCase):
     solver_class = BestFitLayoutSolver
 
     def test_picks_tightest_gap(self):
