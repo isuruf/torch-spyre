@@ -27,11 +27,21 @@ from . import customops  # noqa: F401
 
 import threading
 
+aten = torch.ops.aten
+
 # A module-level lock to make the CM thread-safe
 _decompositions_lock = threading.RLock()
 
 # Dictionary for Spyre-specific decompositions
-spyre_decompositions: dict = {}
+# Some decompositions from torch._decomp are not used in
+# in torch._inductor. We re-add them here
+spyre_decompositions: dict = {
+    **decomp.get_decompositions(
+        [
+            aten.sub,
+        ]
+    ),
+}
 
 # Exclude specific Inductor default decompositions on Spyre.
 # Some Inductor decompositions do not work reliably on the Spyre backend yet.
