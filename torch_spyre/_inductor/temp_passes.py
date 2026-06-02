@@ -15,6 +15,7 @@
 # This file contains inductor passes that are only needed as temp fixes
 
 import torch
+import torch._prims as prims
 from torch._inductor.ir import ComputedBuffer
 from torch._inductor.pattern_matcher import (
     Arg,
@@ -348,6 +349,10 @@ def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
         torch.ops.aten.mul.Tensor,
         torch.ops.aten.true_divide.Tensor,
         torch.ops.aten.div.Tensor,
+        prims.add,
+        prims.sub,
+        prims.mul,
+        prims.div,
     ]
 
     for node in graph.nodes:
