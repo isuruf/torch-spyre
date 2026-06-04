@@ -82,11 +82,7 @@ class _SpyreImpl:
             # Customops must be imported here because decompositions.py references
             # torch.ops.spyre.* at module level (e.g. torch.ops.spyre.rms_norm).
             import torch_spyre._inductor.customops  # noqa: F401
-            from torch_spyre._inductor.decompositions import (
-                _register_spyre_dispatchkey_kernels_permanently,
-            )
-
-            _register_spyre_dispatchkey_kernels_permanently()
+            import torch_spyre._inductor.decompositions  # noqa: F401
 
     def _is_in_bad_fork(self) -> bool:
         return self._in_bad_fork
