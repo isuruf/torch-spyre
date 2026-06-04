@@ -24,44 +24,6 @@ import operator
 aten = torch.ops.aten
 
 
-# Decorator to keep track of compiled variant
-def compile_once(op, **compile_kwargs):
-    def decorator(fn):
-        compiled = None
-
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            nonlocal compiled
-            nonlocal op
-            if compiled is None:
-                if isinstance(op, str):
-                    op = operator.attrgetter(op)(torch.ops)
-                compiled = torch.compile(op, **compile_kwargs)
-            return fn(*args, compiled=compiled, **kwargs)
-
-        # We remove the `compiled` arg from the signature to have
-        # a clean signature.
-        old_signature = inspect.signature(fn)
-        params = dict(old_signature.parameters)
-        params.pop("compiled", None)
-        new_signature = old_signature.replace(parameters=params.values())
-        wrapper.__signature__ = new_signature
-
-        return wrapper
-
-    return decorator
-
-
-def maybe_wrap_dim(dim: int, ndims: int) -> int:
-    if dim < 0:
-        return dim + ndims
-    return dim
-
-
-def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
-    return compiled(*args, **kwargs)
-
-
 def register_torch_compile_kernel(ops):
     for op in _get_op_overloads(ops):
         if "Tensor" not in str(op._schema):
@@ -71,7 +33,7 @@ def register_torch_compile_kernel(ops):
         if "dtype" in op.name():
             # ops that change dtype are not supported yet
             continue
-        compiled_kernel = compile_once(op, dynamic=False)(dispatch_to_torch_compile)
+        compiled_kernel = torch.compile(op, dynamic=False)
         torch.library.register_kernel(op.name(), ["spyre"])(compiled_kernel)
 
 
