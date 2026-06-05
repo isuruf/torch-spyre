@@ -21,6 +21,7 @@ import torch
 import torch._decomp as decomp
 
 from .errors import Unsupported
+from ..ops.fallbacks import _get_op_overloads
 from . import customops  # noqa: F401
 
 import threading
@@ -64,11 +65,11 @@ def register_spyre_decomposition(
         #    PrivateUse1 kernel registration.
         #    Skip ops that already have a PrivateUse1 kernel (e.g. from eager.py) to
         #    avoid registration conflicts.
-        ops_list = ops if isinstance(ops, list) else [ops]
+        ops_list = _get_op_overloads(ops)
         aten_ops = [
             op
             for op in ops_list
-            if getattr(op, "namespace", None) == "aten"
+            if op.namespace == "aten"
             and not torch._C._dispatch_has_kernel_for_dispatch_key(
                 op._name, "PrivateUse1"
             )
