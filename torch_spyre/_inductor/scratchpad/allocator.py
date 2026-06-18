@@ -212,7 +212,6 @@ class ScratchpadAllocator(ABC):
         }
         lifetimes = calculate_liveness(graph)
         for buf_name, info in mem_usage.items():
-            print(graph.get_buffer(buf_name), in_place_allowed[buf_name])
             allow_inplace[buf_name] = []
             if not in_place_allowed[buf_name]:
                 continue
