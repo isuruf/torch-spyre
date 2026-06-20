@@ -105,10 +105,12 @@ def enable_spyre_context(
     Loops.has_large_inner_fn = lambda self, threshold=None: True
 
     from torch._inductor.fx_passes import joint_graph
+    from torch_spyre._inductor.patterns import spyre_pass_pattern_dict
 
     origin_pass = list(joint_graph.pass_patterns)
     # disable mul_softmax_pattern and div_softmax_pattern for now
     joint_graph.pass_patterns.pop()
+    joint_graph.pass_patterns.append(spyre_pass_pattern_dict)
 
     # Inject the pre_scheduling_passes before the Scheduler is constructed,
     # allowing the passes to modify the graph IR (buffers, inputs, constants).
