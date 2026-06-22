@@ -700,7 +700,7 @@ def lower_gelu(x, approximate="none"):
 
 
 @register_spyre_lowering(torch.ops.spyre.silu)
-def lower_silu(x, approximate="none"):
+def lower_silu(x):
     pw = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),
