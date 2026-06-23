@@ -44,15 +44,6 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
     }
 )
 
-OP_GOOD_FOR_LX_INPLACE = frozenset(
-    {
-        "exp",
-        "sub",
-        "add",
-        "rsqrt",
-    }
-)
-
 
 def clone_at_graph_boundaries() -> bool:
     """True when clone ops are eligible for LX, enabling clone insertion at graph
