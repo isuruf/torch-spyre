@@ -54,6 +54,7 @@ class SpyreCompileCache:
             cls.__cache_hits += 1
             cache_found = True
         else:
+            cache_dir_loc.mkdir(parents=True, exist_ok=True)
             cache_found = False
         return (str(cache_dir_loc), cache_found)
 
@@ -72,23 +73,7 @@ class SpyreCompileCache:
 
     @staticmethod
     def artifacts_exist(cache_dir_loc: str) -> bool:
-        return (Path(cache_dir_loc) / "g2.graph.cbor").exists()
-
-
-@contextmanager
-def cache_context(op_specs: list[OpSpec], specs_hash: str | None = None):
-    spyre_cache = get_spyre_cache()
-    dir_hash = (
-        specs_hash
-        if specs_hash is not None
-        else sha256(str(op_specs).encode()).hexdigest()
-    )  # Create a unique directory name based on the specs
-    spec_cache_dir = Path(spyre_cache.cache_dir()) / dir_hash
-    spec_cache_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        yield str(spec_cache_dir)
-    finally:
-        pass
+        return (Path(cache_dir_loc) / "spyreCodeDir" / "spyrecode.json").exists()
 
 
 spyre_cache = SpyreCompileCache()

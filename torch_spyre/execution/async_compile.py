@@ -55,7 +55,6 @@ class SpyreAsyncCompile:
             # Invoke backend compiler of SDSC Bundle
             with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
                 subprocess.run(["dxp_standalone", "-d", output_dir], check=True)
-            convert_artifacts(output_dir)
 
         return SpyreSDSCKernelRunner(kernel_name, output_dir)
 
