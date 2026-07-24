@@ -199,6 +199,27 @@ def _resolve_config() -> Dict[str, LogLevel]:
     torch_logs_config = _parse_torch_logs()
     config.update(torch_logs_config)
 
+    # When a user explicitly configures a parent component, propagate that
+    # level to any more-specific defaults that would otherwise shadow it.
+    # For example, TORCH_LOGS='+spyre.inductor' should override the default
+    # WARNING entry for 'spyre.inductor.codegen' so that child loggers like
+    # 'spyre.inductor.codegen.superdsc' resolve to the user-specified level.
+    explicit_sources = {
+        "TORCH_LOGS",
+        "legacy:SPYRE_INDUCTOR_LOG",
+        "legacy:TORCH_SPYRE_DEBUG",
+    }
+    for component in list(config):
+        if _config_source.get(component, "default") not in explicit_sources:
+            # Check if a less-specific ancestor was explicitly configured
+            parts = component.split(".")
+            for i in range(len(parts) - 1, 0, -1):
+                parent = ".".join(parts[:i])
+                if _config_source.get(parent, "default") in explicit_sources:
+                    config[component] = config[parent]
+                    _config_source[component] = _config_source[parent]
+                    break
+
     for component in config:
         if component not in _config_source:
             _config_source[component] = "default"
@@ -279,6 +300,36 @@ def initialize():
     configure_python_logging()
 
 
+def _sync_cpp_config():
+    """Push current Python config to the C++ LoggingConfig singleton."""
+    from torch_spyre._C import _logging as cpp_logging
+
+    config = cpp_logging.LoggingConfig.instance()
+    config.initialize_from_python(get_config_for_cpp())
+    config.set_log_file(_log_file_path or "")
+
+
+def reset():
+    """Reset logging configuration and re-initialize from environment.
+
+    This clears all state and re-reads environment variables. Intended for
+    testing scenarios where env vars are modified after initial import.
+    """
+    global _config, _config_source, _log_file_path, _log_file_source
+    global _initialized, _python_logging_configured
+
+    with _get_lock():
+        _config = {}
+        _config_source = {}
+        _log_file_path = None
+        _log_file_source = "default"
+        _initialized = False
+        _python_logging_configured = False
+
+    initialize()
+    _sync_cpp_config()
+
+
 def get_log_level(component: str) -> LogLevel:
     """Get effective log level for a component.
 
@@ -328,6 +379,7 @@ def set_log_level(component: str, level: str):
         if component == "spyre":
             root_logger = logging.getLogger("spyre")
             root_logger.setLevel(int(level_enum))
+    _sync_cpp_config()  # Push change to C++ singleton
 
 
 def enable(component: str):
@@ -356,7 +408,14 @@ def get_log_file() -> Optional[str]:
 
 
 def set_log_file(path: Optional[str]):
-    """Set the log file path programmatically."""
+    """Set the log file path programmatically.
+
+    Thread-safety note: on the C++ side the old stream is destroyed
+    immediately, so this must not be called while C++ threads are
+    actively emitting log records.  In normal usage this is safe
+    because configuration happens at import time or under the GIL
+    before compiled workloads spawn threads.
+    """
     global _log_file_path, _log_file_source, _python_logging_configured
 
     if not _initialized:
@@ -367,6 +426,8 @@ def set_log_file(path: Optional[str]):
         _log_file_source = "programmatic" if path else "default"
         _python_logging_configured = False
         configure_python_logging()
+
+    _sync_cpp_config()
 
 
 def get_effective_config() -> Dict[str, str]:

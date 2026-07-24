@@ -16,6 +16,7 @@
 import inspect
 import io
 import logging
+import time
 from typing import Optional, Any, Callable
 
 import torch
@@ -43,7 +44,12 @@ from .temp_passes import (
     mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
 )
-from .coarse_tile import hints_to_coarse_tile_groups
+from .coarse_tile import (
+    hints_to_coarse_tile_groups,
+    reorder_unhinted_interlopers,
+    span_overflow_groups,
+    validate_coarse_tile_groups,
+)
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,
@@ -55,7 +61,11 @@ from .propagate_layouts import (
     propagate_spyre_tensor_layouts,
 )
 from .optimize_restickify import optimize_restickify_locations
-from .insert_restickify import insert_restickify, finalize_layouts
+from .insert_restickify import (
+    finalize_layouts,
+    insert_post_mutation_restickify,
+    insert_restickify,
+)
 from .memory_planning import memory_planning
 from .work_division import (
     span_reduction,
@@ -64,7 +74,6 @@ from .work_division import (
 )
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 from .scratchpad.allocator import (
-    StrategyBCoOptimizingAllocator,
     scratchpad_planning,
 )
 from .fusion import spyre_fuse_nodes
@@ -72,7 +81,6 @@ from .scheduler import build_loop_scheduler_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
-from .chunk_large_tensors import chunk_large_tensors
 from .coarse_tile import coarse_tile
 from .dump_fx_graph import dump_fx_graph
 from .dump_loop_ir import dump_loop_ir
@@ -107,6 +115,26 @@ def _format_operations(operations: list[Operation]) -> str:
             buf.write(f"\n  {op.data}")
         buf.write("\n\n")
     return buf.getvalue()
+
+
+def _get_pass_name(pass_fn: Callable) -> str:
+    """Get a human-readable name for a pass function."""
+    if hasattr(pass_fn, "__name__"):
+        return pass_fn.__name__
+    if hasattr(pass_fn, "__func__"):
+        return pass_fn.__func__.__name__
+    return type(pass_fn).__name__
+
+
+def _should_log_pass(pass_name: str) -> bool:
+    """Check if per-pass logging is enabled for the given pass name."""
+    log_passes_cfg = config.log_passes
+    if not log_passes_cfg:
+        return False
+    if log_passes_cfg in ("all", "1"):
+        return True
+    selected = {s.strip() for s in log_passes_cfg.split(",")}
+    return pass_name in selected
 
 
 def _graph_has_spyre_device(graph: torch.fx.graph.Graph) -> bool:
@@ -271,18 +299,25 @@ def _runs(*passes: Callable) -> Callable[[Callable], Callable]:
     return annotate
 
 
-@_runs(chunk_large_tensors)
-def _maybe_chunk_large_tensors(graph: GraphLowering) -> None:
-    if config.chunk_large_tensors:
-        chunk_large_tensors(graph)
-
-
-@_runs(hints_to_coarse_tile_groups, coarse_tile)
+@_runs(
+    reorder_unhinted_interlopers,
+    hints_to_coarse_tile_groups,
+    span_overflow_groups,
+    validate_coarse_tile_groups,
+    coarse_tile,
+)
 def _maybe_coarse_tile(graph: GraphLowering) -> None:
+    groups = []
     if not config.ignore_wsr_hints:
-        groups = hints_to_coarse_tile_groups(graph)
-        if groups:
-            coarse_tile(graph, groups=groups)
+        reorder_unhinted_interlopers(graph)
+        groups += hints_to_coarse_tile_groups(graph)
+    if not config.ignore_span_overflow_hints:
+        groups += span_overflow_groups(graph)
+    if groups:
+        op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
+        groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
+        validate_coarse_tile_groups(groups)
+        coarse_tile(graph, groups=groups)
 
 
 @_runs(cost_model_matmul_division, work_distribution)
@@ -297,10 +332,9 @@ def _distribute_work(graph: GraphLowering) -> None:
 def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     if not config.lx_planning:
         return
-    allocator = (
-        StrategyBCoOptimizingAllocator() if config.co_optimizing_lx_planning else None
-    )
-    scratchpad_planning(graph, allocator=allocator)
+    # The allocator (and its layout solver) is selected from config by
+    # scratchpad_planning -> select_allocator; no allocator wiring here.
+    scratchpad_planning(graph)
 
 
 class CustomPreSchedulingPasses:
@@ -330,12 +364,12 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
+            insert_post_mutation_restickify,
             insert_bmm_padding,
             #
             dedup_and_promote_constants,
             #
             # Working Set Reduction
-            _maybe_chunk_large_tensors,
             propagate_named_dims,
             assign_dim_hints,
             _maybe_coarse_tile,
@@ -359,7 +393,20 @@ class CustomPreSchedulingPasses:
         dump_loop_ir(graph.operations, "LoopLevel IR - BEFORE pre-scheduling passes")
 
         for pass_fn in self.passes:
+            t0 = time.perf_counter()
             pass_fn(graph)
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(
+                    "elapsed %5dms  %s",
+                    (time.perf_counter() - t0) * 1000,
+                    _get_pass_name(pass_fn),
+                )
+
+            pass_name = _get_pass_name(pass_fn)
+            if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
+                logger.debug(
+                    "AFTER %s\n%s", pass_name, _format_operations(graph.operations)
+                )
 
         if logger.isEnabledFor(logging.INFO):
             logger.info("AFTER PRE-SCHEDULING\n%s", _format_operations(graph.operations))
