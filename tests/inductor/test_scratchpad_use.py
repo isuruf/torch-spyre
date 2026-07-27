@@ -763,14 +763,14 @@ class TestCloneAtGraphBoundaries(
 class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
     """Generic real-graph coverage for the co-optimising allocator.
 
-    ``StrategyBCoOptimizingAllocator`` (``co_optimizing_lx_planning=True``) seeds
-    from the core-division work-distribution, commits the winning splits onto
+    DFS-based co-optimizing allocator (``co_optimizing_lx_planning=True``) searches
+    over candidate core divisions, commits the winning splits onto
     ``op_it_space_splits``, then places buffers. These tests put real compiled
     graphs through that path.
 
     The prescribed-allocation tests encode the *desired* plan, which is the one
-    StrategyB produces. These plans are brittle and are not unique but are
-    plans which achieve desirable performance. New plans should be profiled
+    the DFS co-optimizer produces. These plans are brittle and are not unique but
+    are plans which achieve desirable performance. New plans should be profiled
     before making these test more permissive.
 
     NOTE: this suite is intentionally *disabled* today. Unlike
@@ -1284,8 +1284,8 @@ class TestSelectAllocator(unittest.TestCase):
     def test_dispatch_by_config(self):
         from torch_spyre._inductor.scratchpad.allocator import (
             CoOptimizingAllocator,
+            ExhaustiveSearchSolver,
             ScratchpadAllocator,
-            StrategyBCoOptimizingAllocator,
             select_allocator,
         )
         from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
@@ -1310,7 +1310,10 @@ class TestSelectAllocator(unittest.TestCase):
         with ts_inductor_config.patch(
             layout_solver="greedy", co_optimizing_lx_planning=True
         ):
-            self.assertIsInstance(select_allocator(), StrategyBCoOptimizingAllocator)
+            a = select_allocator()
+            self.assertIsInstance(a, CoOptimizingAllocator)
+            self.assertIsInstance(a.layout_planning, ExhaustiveSearchSolver)
+            self.assertIsInstance(a.layout_planning._inner, GreedyLayoutSolver)
 
         # cpsat + co-optimization routes to the joint allocator when ortools is
         # present, else degrades to greedy placement (the fallback now lives in
