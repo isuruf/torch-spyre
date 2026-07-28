@@ -253,7 +253,7 @@ Scratchpad planning has three layers with separate concerns:
 
 `ScratchpadAllocator` runs pre-passes (clone insertion), gathers
 `LifetimeBoundBuffer`s, hands them to a pluggable solver, then writes the
-chosen LX addresses onto buffer layouts. `StrategyBCoOptimizingAllocator`
+chosen LX addresses onto buffer layouts. `CoOptimizingAllocator`
 extends this flow with a split-search step before the solver runs.
 :::
 
@@ -265,7 +265,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `plan_solver.py` | `MemoryPlanSolver` ABC (declarative exclusion via `partition`/`excluded`), `LifetimeBoundBuffer` |
 | `greedy_solver.py` | `GreedyLayoutSolver` |
 | `firstfit_bestfit_solver.py` | `FirstFitLayoutSolver`, `BestFitLayoutSolver` |
-| `allocator.py` | `ScratchpadAllocator`, `StrategyBCoOptimizingAllocator`, and the single LX-eligibility predicate (`_residency_reasons`, one reason per buffer) |
+| `allocator.py` | `ScratchpadAllocator`, `CoOptimizingAllocator`, and the single LX-eligibility predicate (`_residency_reasons`, one reason per buffer) |
 | `utils.py` | liveness, mem usage, op-name/eligibility helpers |
 
 ### Entry point
@@ -452,7 +452,7 @@ ops sharing a buffer can get different splits (different shapes mean
 different optimal decompositions), which triggers `core_div_mismatch`
 and disqualifies the shared buffer from LX even when it would have fit.
 
-`StrategyBCoOptimizingAllocator` (gated by
+`CoOptimizingAllocator` (gated by
 `config.co_optimizing_lx_planning`, env var `CO_OPTIMIZING_LX_PLANNING=1`)
 treats split choices and LX placement jointly:
 
@@ -554,7 +554,7 @@ compact the address space. Allocate/deallocate cycles fragment LX.
 
 ### Co-optimization is still limited
 
-`StrategyBCoOptimizingAllocator` implements the joint
+`CoOptimizingAllocator` implements the joint
 work-division + LX planning idea. It searches pointwise dim-flips, the
 matmuls' tilings offered to neighbours, cross-matmul split transfer, and a
 shared batch-major `B/M` split for matmuls and reductions. It still never
