@@ -74,7 +74,7 @@ import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Generic, TypeVar, cast
+from typing import TYPE_CHECKING, TypeVar, cast
 import torch
 
 
@@ -92,6 +92,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     ceil_div,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
+    LifetimeBoundBufferWithSolverVars,
     SolveError,
     BufferType,
     _assert_in_place_relationships,
@@ -141,7 +142,7 @@ def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
 
 
 @dataclass
-class _LifetimeBufferWithCpVars(Generic[_BufT]):
+class _LifetimeBufferWithCpVars(LifetimeBoundBufferWithSolverVars):
     """A :class:`LifetimeBoundBuffer` bundled with the CP-SAT variables the
     solver creates for it, so one object flows through the solve instead of a
     buffer list shadowed by a parallel ``name -> {var}`` dict.
@@ -164,17 +165,12 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
     model and the unit capacity ``M`` and creates only the variables here; the
     constraints tying them together are added by the solver methods."""
 
-    buffer: _BufT
     model: "cp_model.CpModel"
-    capacity_units: int
 
     def __post_init__(self):
         b = self.buffer
         m = self.model
         M = self.capacity_units
-        self.name = b.name
-        self.start_time = b.start_time
-        self.end_time = b.end_time
 
         self.in_buffer = m.new_bool_var(f"in_buffer_{b.name}")
         # offset domain [0, M-1]; the resident => offset+eff_size<=M bound is
@@ -182,7 +178,7 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         self.offset = m.new_int_var(0, max(0, M - 1), f"off_{b.name}")
         # Fixed footprint -- no division to pick, so a constant stands in for
         # the joint solver's eff_size var.
-        self.eff_size: object = b.size
+        self.eff_size = b.size
         # Nothing to parallelise without candidate divisions; ``_run`` skips
         # phase 2 when no buffer offers a core-usage term.
         self.cores = None
@@ -236,7 +232,7 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
 
 
 @dataclass
-class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer]):
+class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars):
     """The joint-model wrapper: a :class:`CoreDivisionBuffer` plus the vars for
     its chosen core division (``division``), the per-core footprint that
     division implies (``eff_size``) and its total core usage (``cores`` =
@@ -385,10 +381,14 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         units = ceil_div(buffer.size, self.alignment)
         if isinstance(buffer, CoreDivisionBuffer) and buffer.core_divisions:
             return _CoreDivisionBufferWithCpVars(
-                replace(buffer, size=units), model, self._capacity_units
+                buffer=replace(buffer, size=units),
+                capacity_units=self._capacity_units,
+                model=model,
             )
         return _LifetimeBufferWithCpVars(
-            replace(buffer, size=units), model, self._capacity_units
+            buffer=replace(buffer, size=units),
+            capacity_units=self._capacity_units,
+            model=model,
         )
 
     def _plan_layout_generic(

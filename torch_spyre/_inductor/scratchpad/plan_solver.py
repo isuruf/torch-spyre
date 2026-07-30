@@ -166,6 +166,35 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         )
 
 
+@dataclass
+class LifetimeBoundBufferWithSolverVars:
+    buffer: LifetimeBoundBuffer
+    capacity_units: int
+    # solver var for checking if buffer in lx
+    in_buffer: bool = field(init=False)
+    # solver var for lx address
+    offset: int = field(init=False)
+    # solver var for per core size
+    eff_size: int = field(init=False)
+    # solver var for number of cores
+    cores: int = field(init=False)
+    # dictionary of solver vars for merging inplace
+    # with parents
+    merge_vars: dict[str, bool] = field(init=False)
+
+    @property
+    def name(self):
+        return self.buffer.name
+
+    @property
+    def start_time(self):
+        return self.buffer.start_time
+
+    @property
+    def end_time(self):
+        return self.buffer.end_time
+
+
 def _assert_in_place_relationships(
     buffers: Sequence["LifetimeBoundBuffer"],
 ) -> None:
