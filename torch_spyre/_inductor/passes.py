@@ -498,13 +498,9 @@ class CustomPreSchedulingPasses:
                 )
 
         if logger.isEnabledFor(logging.INFO):
-<<<<<<< HEAD
-            logger.info("AFTER PRE-SCHEDULING\n%s", _format_operations(graph.operations))
+            logger.info("AFTER PRE-SCHEDULING\n%s", format_operations(graph.operations))
         dump_loop_ir(graph.operations, "LoopLevel IR - AFTER pre-scheduling passes")
         dump_cost_model(graph.operations)
-=======
-            logger.info("AFTER PRE-SCHEDULING\n%s", format_operations(graph.operations))
->>>>>>> cdc895fcb0aa8feaf9e7c4dd153a43303aa8588f
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)
