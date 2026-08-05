@@ -376,7 +376,7 @@ def extract_op_features(op) -> OpFeatures:
         ArgTraffic(
             name=op.get_operation_name(),
             role="output",
-            mem=out_mem,
+            is_lx=(out_mem == "lx"),
             elems=out_elems,
             dims=list(out_dims),
             logical=list(out_size),
@@ -420,7 +420,7 @@ def extract_op_features(op) -> OpFeatures:
             ArgTraffic(
                 name=name,
                 role="input",
-                mem=mem,
+                is_lx=(mem == "lx"),
                 elems=in_elems,
                 broadcast=broadcast,
                 dims=list(dims),

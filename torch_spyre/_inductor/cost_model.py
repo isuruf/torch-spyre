@@ -133,7 +133,7 @@ class ArgTraffic:
 
     name: str
     role: str  # "input" | "output"
-    mem: str  # "lx" | "hbm"
+    is_lx: bool
     elems: int  # device element count = prod(dims) (its own one-load size)
     broadcast: bool = False  # loaded once & reused across the broadcast dim
     # DEVICE (stick) shape, e.g. [4, 512, 64]
@@ -147,6 +147,12 @@ class ArgTraffic:
     # at one address across the loop (a per-tile accumulator re-read/written each
     # iteration). LX-resident args are ~free regardless (excluded from read/write).
     loop_factor: int = 1
+
+    @property
+    def mem(self) -> str:
+        if isinstance(self.is_lx, bool):
+            return "lx" if self.is_lx else "hbm"
+        raise ValueError("Symbolic is_lx not supported for this operation")
 
 
 @dataclasses.dataclass
@@ -193,9 +199,9 @@ class OpFeatures:
         """
         return (
             sum(
-                a.elems * a.loop_factor
+                a.elems * a.loop_factor * (1 - a.is_lx)
                 for a in self.args
-                if a.mem == "hbm" and a.role == "input"
+                if a.role == "input"
             )
             * self.dtype_bytes
         )
@@ -204,9 +210,9 @@ class OpFeatures:
         """HBM bytes WRITTEN (output args), scaled by ``loop_factor``."""
         return (
             sum(
-                a.elems * a.loop_factor
+                a.elems * a.loop_factor * (1 - a.is_lx)
                 for a in self.args
-                if a.mem == "hbm" and a.role == "output"
+                if a.role == "output"
             )
             * self.dtype_bytes
         )
@@ -216,7 +222,7 @@ class OpFeatures:
         return self.read_bytes() + self.write_bytes()
 
     def lx_bytes(self) -> int:
-        return sum(a.elems for a in self.args if a.mem == "lx") * self.dtype_bytes
+        return sum(a.elems * a.is_lx for a in self.args) * self.dtype_bytes
 
 
 def op_to_dict(op: "OpFeatures") -> dict:
@@ -502,9 +508,7 @@ def _fused_hbm_bytes(ops: list) -> tuple:
     ext_in: dict = {}  # external input name -> its one-load HBM bytes (dedup across ops)
     for o in ops:
         for a in o.args:
-            if a.mem != "hbm":
-                continue
-            b = a.elems * a.loop_factor * o.dtype_bytes
+            b = a.elems * a.loop_factor * o.dtype_bytes * (1 - a.is_lx)
             if a.role == "input" and a.name.startswith("arg"):
                 ext_in[a.name] = max(ext_in.get(a.name, 0), b)
             elif a.role == "input":
@@ -533,7 +537,7 @@ def _is_outer_broadcast(o) -> bool:
     if getattr(o, "is_matmul", False) or o.is_reduction:
         return False
     ins = [a for a in o.args if a.role == "input" and a.mem == "hbm"]
-    return bool(ins) and all(a.broadcast for a in ins)
+    return bool(ins) and all(a.broadcast * (1 - a.is_lx) for a in ins)
 
 
 def _outer_broadcast_extra_bytes(o, p) -> float:
@@ -625,12 +629,14 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
 
     def _eff_bw(o):  # per-op effective-BW override, or None -> default turnaround
         pat = getattr(o, "hbm_pattern", "")
-        if pat == "stick_scatter":  # cat0: shape-dependent rate (falls with C)
-            return stick_scatter_bw(o, p)
+        # TODO: uncomment
+        # if pat == "stick_scatter":  # cat0: shape-dependent rate (falls with C)
+        #    return stick_scatter_bw(o, p)
         if pat in _pat_bw:  # restickify (transpose), reduce_outer (sumcol)
             return _pat_bw[pat]
-        if _is_broadcast_op(o):
-            return p.bw_broadcast_gbps
+        # TODO: uncomment
+        # if _is_broadcast_op(o):
+        #    return p.bw_broadcast_gbps
         return None
 
     if any(getattr(o, "is_matmul", False) for o in ops):
@@ -674,6 +680,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         # already includes the read/write turnaround -- do NOT add it again. sumcol takes
         # the reduce_outer path above; a FUSED coarse kernel (len>1, e.g. softmax) stays on
         # bw_peak below so its input dedup is not broken.
+        # TODO: skip the cost model in the solver when there's only one op
         mem = (r + w) / reduction_read_bw(_reduction_rows(ops[0]), p)
     else:
         mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * min(r, w)
@@ -690,10 +697,11 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
             mem *= 1.0 + p.pointwise_arity_derate * (n_pw - 1)
     # `write` outer-product re-read: empirical extra HBM traffic, super-linear in the
     # output shape (both operands broadcast, no full input). Charged at bw_peak.
-    mem += (
-        sum(_outer_broadcast_extra_bytes(o, p) for o in ops if _is_outer_broadcast(o))
-        / p.bw_peak_gbps
-    )
+    # TODO: fix this
+    #mem += (
+    #    sum(_outer_broadcast_extra_bytes(o, p) for o in ops if _is_outer_broadcast(o))
+    #    / p.bw_peak_gbps
+    #)
     # OUTPUT-dim (pointwise) coarse-tiling underfill: a short per-core tile underfills
     # the streaming pipeline, derating the bandwidth term. The smallest tile in the
     # bundle governs (worst underfill). 1.0 (no derate) when nothing is output-tiled.
@@ -751,13 +759,13 @@ def explain(ops: list, params: CostParams | None = None) -> str:
         for a in o.args:
             bc = " broadcast (loaded once)" if a.broadcast else ""
             lf = f" xL={a.loop_factor}" if a.loop_factor > 1 else ""
-            counted = a.elems * a.loop_factor * o.dtype_bytes if a.mem == "hbm" else 0
+            counted = a.elems * a.loop_factor * o.dtype_bytes * (1 - a.is_lx)
             dev = a.dims if a.dims else [a.elems]
             log = f"torch {a.logical} -> " if a.logical else ""
             # One line per DEVICE-LAYOUT tensor: name, role, logical->device dims,
             # residency, byte calc, the HBM bytes the model counts, and the loop factor.
             lines.append(
-                f"      {a.role:<6} {a.name:<22} {log}device {dev} in {a.mem.upper()}"
+                f"      {a.role:<6} {a.name:<22} {log}device {dev} in {a.is_lx}"
                 f"  | {a.elems} elems x {o.dtype_bytes}B = {a.elems * o.dtype_bytes} B"
                 f" (hbm counted: {counted} B){lf}{bc}"
             )
