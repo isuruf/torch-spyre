@@ -495,6 +495,13 @@ def mm_spill_frac(tile_area: float, params: CostParams | None = None) -> float:
         p.mm_spill_slope * math.log2(max(1.0, tile_area / p.mm_spill_area0)),
     )
 
+import sympy
+
+def max(*args):
+    return sympy.Max(*args)
+
+def min(*args):
+    return sympy.Min(*args)
 
 def _fused_hbm_bytes(ops: list) -> tuple:
     """(read, write) HBM bytes for a FUSED bundle, counting each distinct EXTERNAL graph

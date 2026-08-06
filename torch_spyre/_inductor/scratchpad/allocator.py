@@ -49,6 +49,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
+    LifetimeBoundBufferWithSolverVars,
     MemoryPlanSolver,
     SolveError,
     BufferType,
@@ -1669,7 +1670,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         graph: GraphLowering,
         in_place: Optional[dict[str, list[str]]],
         divisions: dict[str, list[CoreDivision]],
-    ) -> list[CoreDivisionBuffer]:
+    ) -> list[LifetimeBoundBufferWithSolverVars]:
         """Build the ``CoreDivisionBuffer``s handed to the solver.
 
         Every buffer carries its candidate ``divisions`` and is sized by its
@@ -1804,7 +1805,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     else BufferType.Intermediate,
                 )
             )
-        return buffers
+        bufmap = {buf.name: buf for buf in buffers}
+
+        op_features = []
+        for output_name, info in mem_usage.items():
+            op_features.append(self._extract_op_features(graph, output_name, bufmap))
+
+        from torch_spyre._inductor.cost_model import predict_ops
+        print(predict_ops(op_features))
+        b = 0
+        for o in op_features:
+          b += predict_ops([o])
+        print(b)
+        print('done')
+        return list(bufmap.values())
 
     def _is_frame_changing_clone(self, op: Operation, buf_name: str) -> bool:
         """True if ``op`` is a clone whose output ``buf_name`` has an iteration
@@ -2053,12 +2067,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             out.append(_per_core_view_from_prep(prep_cache[key], coeff))
         return out
 
-    def _extract_op_features(self, graph, output_name):
+    def _extract_op_features(self, graph, output_name, buffers):
         """Build OpFeatures for one ComputedBuffer op (best-effort)."""
         from torch_spyre._inductor.dump_cost_model import (
             _loop_features,
             _int,
-            _cores,
             _matmul_features,
             _row_split,
             _input_traffic,
@@ -2071,7 +2084,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         op = graph.get_buffer(output_name)
         data = getattr(op, "data", None)
         is_reduction = getattr(data, "reduction_type", None) is not None
-        # TODO: make this symbolic when looping works
+        # TODO: make this symbolic when wsr works
         loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
         # An arg ADVANCES (factor 1, walks the full tensor once across tiles) when this op
         # tiles a dim the arg traverses: an OUTPUT (pointwise) dim -> all args advance; a
@@ -2088,18 +2101,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         out_dims = _device_dims(op.get_layout()) or out_size
         out_elems = _prod_ints(out_dims)
 
-        # TODO: make this symbolic
-        cores = _cores(op)
+        #cores = buffers[output_name].cores
+        cores = sympy.Symbol(f"cores_{output_name}")
 
+        def max(*args):
+            return sympy.Max(*args)
         # Cross-core ring combine: work division splits OUTPUT dims first, then the reduced
         # axis with leftover cores -> the reduced axis is split only when out_elems < cores.
         # Approx k as the cores not absorbed by the output (refine if rung 11 needs it).
         reduction_cores = 1
-        if is_reduction and out_elems < cores:
+        if is_reduction:
             reduction_cores = max(1, cores // max(1, out_elems))
 
-        # TODO: fix this
-        is_lx = True
+        is_lx = sympy.Symbol(f"is_lx_{output_name}")
 
         # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull
         # MACs (M*N*K), the per-core M tile (pt_eff), and the K-split k (-> reduction_cores,
@@ -2109,6 +2123,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         matmul_macs, matmul_rows_per_core, matmul_cols_per_core = 0, 0.0, 0.0
         matmul_a_bytes = matmul_b_bytes = 0
         if is_matmul:
+            # TODO: make symbolic
             (
                 matmul_macs,
                 matmul_rows_per_core,
@@ -2132,6 +2147,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             rows = out_dims[-2]
             # full-buffer alloc: per-tile slice is rows / loop_trip
             rows = rows / loop_trip * (1 - is_lx) + rows * is_lx
+            # TODO: make symbolic
             tile_rows_per_core = rows / _row_split(op, cores)
 
         # Output advances (factor 1) when this op tiles an output dim (pointwise tiling
@@ -2178,26 +2194,30 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             except Exception:  # noqa: BLE001
                 broadcast = False
                 raise
-            mem, dims, in_elems, in_logical = _input_traffic(name)
+            _, dims, in_elems, in_logical = _input_traffic(name)
             if in_elems is None:  # unresolved buffer -> fallback
                 # A broadcast operand with no resolvable buffer (e.g. a scalar constant)
                 # is loaded once and is at most ~1 element -- do NOT inflate it to the
                 # output size. Only a NON-broadcast unresolved read is conservatively
                 # sized at the full output.
                 if broadcast:
-                    mem, dims, in_elems, in_logical = "hbm", [1], 1, [1]
+                    dims, in_elems, in_logical = [1], 1, [1]
                 else:
-                    mem, dims, in_elems, in_logical = (
-                        "hbm",
+                    dims, in_elems, in_logical = (
                         list(out_dims),
                         out_elems,
                         [],
                     )
+                inp_is_lx = False
+            else:
+                #inp_is_lx = buffers[name].in_buffer
+                inp_is_lx = sympy.Symbol(f"is_lx_{name}")
+
             args.append(
                 ArgTraffic(
                     name=name,
                     role="input",
-                    mem=mem,
+                    is_lx=inp_is_lx,
                     elems=in_elems,
                     broadcast=broadcast,
                     dims=list(dims),
