@@ -73,15 +73,17 @@ class SolverToPermutation:
         self.solver = solver
 
     def permutation(self, buffers: list[LifetimeBoundBuffer]) -> list[int]:
-        """Lay out the given buffers, then sort them by their addresses. Any
-        non-allocated buffers come after all allocated buffers. Return this ordering
-        as a list of indices; the first index is i such that buffers[i] is one of the
-        buffers allocated at address 0, etc. This yields a permutation that gives the
-        given layout, or an equivalent one, or occasionally even a better one."""
-        allocated_buffers = self.solver.plan_layout(copy.deepcopy(buffers))
-        # Typically, allocated_buffers is just the argument to plan_layout, which has
-        # been modified in-place. But we can't assume that. Moreover, we need to
-        # protect the passed in buffers from being modified by the given solver.
+        """Lay out ``self.solver``'s own buffers, then sort ``buffers`` by the
+        resulting addresses (looked up by name). Any non-allocated buffers come
+        after all allocated buffers. Return this ordering as a list of indices;
+        the first index is i such that buffers[i] is one of the buffers
+        allocated at address 0, etc. This yields a permutation that gives the
+        given layout, or an equivalent one, or occasionally even a better one.
+
+        ``buffers`` need not be (and, to protect them from mutation, should not
+        be) the same objects backing ``self.solver`` -- only their names need to
+        match, which is how the resulting addresses are looked up."""
+        allocated_buffers = self.solver.plan_layout()
 
         max_address = max(
             (b.address for b in allocated_buffers if b.address is not None), default=0
@@ -102,48 +104,6 @@ SolverScheduleOption: TypeAlias = CoolingSchedule | Literal["auto"]
 
 
 class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
-    """We can only do the full initialization when we know the list of buffers, so
-    this class is just a shim to create the actual solver."""
-
-    def __init__(
-        self,
-        size: int,
-        alignment: int = 128,
-        *,
-        initial: SolverInitialOption = "first_fit",
-        schedule: SolverScheduleOption = "auto",
-        random: Optional[rnd.Random] = None,
-    ):
-        super().__init__(size, alignment)
-        self.initial = initial
-        self.schedule = schedule
-        self.random = random
-
-    def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
-    ) -> list[LifetimeBoundBuffer]:
-        # Barred buffers keep address=None and stay out of the permutation
-        # entirely, so no annealing move can ever place one.
-        placeable, _ = self.partition(buffers)
-        if not placeable:
-            return list(buffers)
-        _buffers = list(placeable)
-        solver = SimulatedAnnealingSolverWithBuffers(
-            _buffers,
-            self.limit,
-            self.alignment,
-            initial=self.initial,
-            schedule=self.schedule,
-            random=self.random,
-        )
-        solver.solve()
-        solver.finalize()
-        # The annealer mutates the buffer objects in place, so the caller's full
-        # list (barred buffers included, still at address=None) is the result.
-        return list(buffers)
-
-
-class SimulatedAnnealingSolverWithBuffers:
     """Drives simulated annealing over a :class:`PermutationBasedLayoutSolver`.
 
     The layout is held as a *member* (``self.plan``), not a base class. This lets
@@ -154,7 +114,7 @@ class SimulatedAnnealingSolverWithBuffers:
 
     def __init__(
         self,
-        buffers: list[LifetimeBoundBuffer],
+        buffers: Sequence[LifetimeBoundBuffer],
         size: int,
         alignment: int = 128,
         *,
@@ -162,6 +122,16 @@ class SimulatedAnnealingSolverWithBuffers:
         schedule: SolverScheduleOption = "auto",
         random: Optional[rnd.Random] = None,
     ):
+        super().__init__(buffers, size, alignment)
+        self.size = size
+
+        # Barred buffers keep address=None and stay out of the permutation
+        # entirely, so no annealing move can ever place one.
+        placeable, _ = self.partition()
+        if not placeable:
+            return list(self.buffers)
+        _buffers = list(placeable)
+        
         if isinstance(initial, list):
             if sorted(initial) != list(range(len(buffers))):
                 raise ValueError(
@@ -170,19 +140,16 @@ class SimulatedAnnealingSolverWithBuffers:
             self.initial = initial
         else:
             if initial == "first_fit":
-                initial = FirstFitLayoutSolver(size, alignment)
+                initial = FirstFitLayoutSolver(copy.deepcopy(buffers), size, alignment)
             elif initial == "best_fit":
-                initial = BestFitLayoutSolver(size, alignment)
+                initial = BestFitLayoutSolver(copy.deepcopy(buffers), size, alignment)
             elif initial == "greedy":
-                initial = GreedyLayoutSolver(size, alignment)
+                initial = GreedyLayoutSolver(copy.deepcopy(buffers), size, alignment)
 
             assert isinstance(initial, MemoryPlanSolver)
             convertor = SolverToPermutation(initial)
             self.initial = convertor.permutation(buffers)
 
-        self.buffers = buffers
-        self.size = size
-        self.alignment = alignment
         self.plan = PermutationBasedLayoutSolver(buffers, self.initial, size, alignment)
         self.quality_logs: list[list[float]] = []
         self.temperature_logs: list[list[float]] = []
@@ -210,6 +177,13 @@ class SimulatedAnnealingSolverWithBuffers:
             # (build reproducibility and compilation caching depend on it). Pass
             # an explicit Random to vary the search (e.g. in benchmarks/tests).
             self.random = rnd.Random(0)
+    
+    def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
+        self.solve()
+        self.finalize()
+        # The annealer mutates the buffer objects in place, so the caller's full
+        # list (barred buffers included, still at address=None) is the result.
+        return list(self.buffers)
 
     def finalize(self) -> None:
         self.plan.finalize()
