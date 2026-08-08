@@ -142,6 +142,57 @@ def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
 
 
 @dataclass
+class IntVar:
+    inner: cp_model.IntVar
+    model: cp_model.CpModel
+
+    def _unwrap(self, x):
+        if isinstance(x, IntVar):
+            return x.inner
+        else:
+            return x
+
+    def __add__(self, other):
+        return IntVar(self.inner + self._unwrap(other))
+
+    def __radd__(self, other):
+        return IntVar(self._unwrap(other) + self.inner)
+
+    def __sub__(self, other):
+        return IntVar(self.inner - self._unwrap(other))
+
+    def __rsub__(self, other):
+        return IntVar(self._unwrap(other) - self.inner)
+
+    def __mul__(self, other):
+        return IntVar(self.inner * other)
+
+    def __rmul__(self, other):
+        return IntVar(other * self.inner)
+
+    def __floordiv__(self, other):
+        lb, ub = self.inner.domain.min(), self.inner.domain.max()
+        target = self.model.new_int_var(lb, ub, f"div_{self.inner.name}")
+        self.model.add_division_equality(target, self.inner, self._unwrap(other))
+        return target
+
+
+@dataclass
+class CoreDivisionVar(IntVar):
+    core_divisions: list[CoreDivision]
+    core_division_vars: list[cp_model.IntVar]
+
+    def __rtruediv__(self, other):
+        result = [other / cd.cores_used for cd in self.core_divisions]
+        target = m.new_int_var(0, max(per_core), f"eff_size_{b.name}")
+
+        # tie per-core footprint (output split only) and total core usage to the
+        # chosen division index
+        m.add_element(self.division, per_core, self.eff_size)
+        m.add_element(self.division, cores_used, self.cores)
+
+
+@dataclass
 class _LifetimeBufferWithCpVars(LifetimeBoundBufferWithSolverVars):
     """A :class:`LifetimeBoundBuffer` bundled with the CP-SAT variables the
     solver creates for it, so one object flows through the solve instead of a
@@ -252,16 +303,16 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars):
         # Total cores the op runs on under each division -- includes any
         # reduction-axis split, so a reduction-parallel division counts its full
         # parallelism (``output_partition`` alone would score it as 1 core).
-        cores_used = [cd.cores_used for cd in b.core_divisions]
+        inv_cores_used = [32//cd.cores_used for cd in b.core_divisions]
         self.division = m.new_int_var(0, len(b.core_divisions) - 1, f"div_{b.name}")
         self.eff_size = m.new_int_var(0, max(per_core), f"eff_size_{b.name}")
         # total cores this op uses under the chosen div
-        self.cores = m.new_int_var(0, max(cores_used), f"occ_{b.name}")
+        self.inv_cores = m.new_int_var(0, max(cores_used), f"inv_cores_{b.name}")
 
         # tie per-core footprint (output split only) and total core usage to the
         # chosen division index
         m.add_element(self.division, per_core, self.eff_size)
-        m.add_element(self.division, cores_used, self.cores)
+        m.add_element(self.division, inv_cores_used, self.inv_cores)
 
     @property
     def parents(self) -> list[str]:
@@ -353,7 +404,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         )
 
     def plan_layout_and_core_divisions(
-        self, buffers: Sequence[CoreDivisionBuffer]
+        self,
+        buffers: Sequence[CoreDivisionBuffer],
+        cost_expr: sympy.Expr | None = None,
     ) -> list[CoreDivisionBuffer]:
         """Jointly choose each buffer's core division and its LX placement.
 
@@ -364,7 +417,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             "All buffers must have at least 1 valid core division"
         )
         return cast(
-            "list[CoreDivisionBuffer]", list(self._plan_layout_generic(buffers))
+            "list[CoreDivisionBuffer]",
+            list(self._plan_layout_generic(buffers, cost_expr=cost_expr)),
         )
 
     def _wrap(
@@ -395,6 +449,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         self,
         buffers: Sequence[LifetimeBoundBuffer | CoreDivisionBuffer],
         log_lx_usage: bool = False,
+        cost_expr: sympy.Expr | None = None,
     ) -> list[LifetimeBoundBuffer | CoreDivisionBuffer]:
         if not buffers:
             return []
@@ -416,7 +471,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # Solve on copies so we never mutate the caller's buffers.
         working = {b.name: self._wrap(model, b) for b in buffers}
 
-        solved = self._run(model, working, forced_reasons)
+        solved = self._run(model, working, forced_reasons, cost_expr=cost_expr)
         # Surface a drop cause for every spilled buffer: the pre-solve forced
         # reason when we have one, otherwise the solver chose to spill it.
         self.spill_reasons = {
@@ -443,6 +498,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         model: "cp_model.CpModel",
         tensors: dict[str, _LifetimeBufferWithCpVars],
         forced_reasons: dict[str, str],
+        cost_expr: sympy.Expr | None,
     ) -> dict[str, LifetimeBoundBuffer]:
         children_of = self._get_children(tensors)
         self._add_inplace_relaxation(model, tensors)
@@ -456,6 +512,14 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         )
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0
+
+        sym_map = {}
+        for t in tensors.values():
+            sym_map[t.buffer.sym_is_lx] = t.in_buffer
+            sym_map[t.buffer.sym_inv_cores] = t.inv_cores
+
+        cp_cost = sympy.Lambdify(sym_map.keys(), cost_expr, module="math")(sym_map.values())
+        print(cp_cost)
 
         # TODO: Update objective to a maxmin optimization to optimize overall
         # throughput.

@@ -234,6 +234,7 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
     """
     The list of custom passes to run
     """
+
     def __init__(self):
         super().__init__(
             [

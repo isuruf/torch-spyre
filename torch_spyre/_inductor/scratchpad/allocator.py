@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import logging
 import math
 import time
@@ -1460,7 +1461,17 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
     def _solve(self, buffers: Sequence[Any]) -> Sequence[Any]:
         assert self.layout_planning is not None
-        return self.layout_planning.plan_layout_and_core_divisions(buffers)
+        bufmap = {buf.name: buf for buf in buffers}
+
+        op_features = []
+        mem_usage = mem_usage_by_buf(graph)
+        for output_name, info in mem_usage.items():
+            op_features.append(self._extract_op_features(graph, output_name, bufmap))
+
+        from torch_spyre._inductor.cost_model import predict_ops
+
+        cost_expr = predict_ops(op_features)
+        return self.layout_planning.plan_layout_and_core_divisions(buffers, cost_expr)
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         # The divisions must be committed such that any buffer clones can correctly
@@ -1805,20 +1816,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     else BufferType.Intermediate,
                 )
             )
-        bufmap = {buf.name: buf for buf in buffers}
-
-        op_features = []
-        for output_name, info in mem_usage.items():
-            op_features.append(self._extract_op_features(graph, output_name, bufmap))
-
-        from torch_spyre._inductor.cost_model import predict_ops
-        print(predict_ops(op_features))
-        b = 0
-        for o in op_features:
-          b += predict_ops([o])
-        print(b)
-        print('done')
-        return list(bufmap.values())
+        return buffers
 
     def _is_frame_changing_clone(self, op: Operation, buf_name: str) -> bool:
         """True if ``op`` is a clone whose output ``buf_name`` has an iteration
@@ -2083,6 +2081,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         op = graph.get_buffer(output_name)
         data = getattr(op, "data", None)
+
+        import itertools
+
+        buf = buffers[output_name]
+
+        op.op_it_space_splits = buf.sym_core_divs
+
         is_reduction = getattr(data, "reduction_type", None) is not None
         # TODO: make this symbolic when wsr works
         loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
@@ -2101,11 +2106,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         out_dims = _device_dims(op.get_layout()) or out_size
         out_elems = _prod_ints(out_dims)
 
-        #cores = buffers[output_name].cores
-        cores = sympy.Symbol(f"cores_{output_name}")
+        cores = 1/buf.sym_inv_cores
 
         def max(*args):
             return sympy.Max(*args)
+
         # Cross-core ring combine: work division splits OUTPUT dims first, then the reduced
         # axis with leftover cores -> the reduced axis is split only when out_elems < cores.
         # Approx k as the cores not absorbed by the output (refine if rung 11 needs it).
@@ -2113,7 +2118,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         if is_reduction:
             reduction_cores = max(1, cores // max(1, out_elems))
 
-        is_lx = sympy.Symbol(f"is_lx_{output_name}")
+        is_lx = buf.sym_is_lx
 
         # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull
         # MACs (M*N*K), the per-core M tile (pt_eff), and the K-split k (-> reduction_cores,
@@ -2210,8 +2215,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     )
                 inp_is_lx = False
             else:
-                #inp_is_lx = buffers[name].in_buffer
-                inp_is_lx = sympy.Symbol(f"is_lx_{name}")
+                inp_is_lx = buffers[name].sym_is_lx
 
             args.append(
                 ArgTraffic(

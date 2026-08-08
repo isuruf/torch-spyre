@@ -165,6 +165,41 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
             ceil_div(self.size, cd.output_partition) for cd in self.core_divisions
         )
 
+    @property
+    def sym_is_lx(self) -> sympy.Symbol
+        return sympy.Symbol(f"is_lx_{self.name}")
+
+    @property
+    def sym_inv_cores(self) -> sympy.Symbol
+        return sympy.Symbol(f"inv_cores_{self.name}")
+
+    @property
+    def sym_core_divs(self) -> tuple[dict, dict]
+        core_divs = self.core_divisions
+ 
+        def unique(args):
+            d = {arg: None for arg in args}
+            return list(d)
+ 
+        orig = op
+        op = copy.copy(op)
+        output_keys = unique(
+            itertools.chain.from_iterable([cd.output_splits for cd in core_divs])
+        )
+        sym_output_splits = {
+            key: sympy.Symbol(f"output_split_{output_name}_{key}")
+            for key in output_keys
+        }
+ 
+        reduction_keys = unique(
+            itertools.chain.from_iterable([cd.output_splits for cd in core_divs])
+        )
+        sym_reduction_splits = {
+            key: sympy.Symbol(f"reduction_split_{output_name}_{key}")
+            for key in reduction_keys
+        }
+        return (sym_output_splits, sym_reduction_splits)
+
 
 @dataclass
 class LifetimeBoundBufferWithSolverVars:
@@ -325,7 +360,7 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
 
     @abstractmethod
     def plan_layout_and_core_divisions(
-        self, buffers: Sequence[CoreDivisionBuffer]
+        self, buffers: Sequence[CoreDivisionBuffer], cost_expr: sympy.Expr | None = None
     ) -> list[CoreDivisionBuffer]:
         """Choose each buffer's core division and its LX placement together.
 

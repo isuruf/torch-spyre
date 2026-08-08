@@ -495,13 +495,17 @@ def mm_spill_frac(tile_area: float, params: CostParams | None = None) -> float:
         p.mm_spill_slope * math.log2(max(1.0, tile_area / p.mm_spill_area0)),
     )
 
+
 import sympy
+
 
 def max(*args):
     return sympy.Max(*args)
 
+
 def min(*args):
     return sympy.Min(*args)
+
 
 def _fused_hbm_bytes(ops: list) -> tuple:
     """(read, write) HBM bytes for a FUSED bundle, counting each distinct EXTERNAL graph
@@ -705,10 +709,10 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # `write` outer-product re-read: empirical extra HBM traffic, super-linear in the
     # output shape (both operands broadcast, no full input). Charged at bw_peak.
     # TODO: fix this
-    #mem += (
+    # mem += (
     #    sum(_outer_broadcast_extra_bytes(o, p) for o in ops if _is_outer_broadcast(o))
     #    / p.bw_peak_gbps
-    #)
+    # )
     # OUTPUT-dim (pointwise) coarse-tiling underfill: a short per-core tile underfills
     # the streaming pipeline, derating the bandwidth term. The smallest tile in the
     # bundle governs (worst underfill). 1.0 (no derate) when nothing is output-tiled.
@@ -724,7 +728,11 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # MATMUL compute = MACs/cores derated by pt_eff (PT-array fill).
     compute = 0.0
     for o in ops:
-        if o.is_matmul and o.matmul_macs > 0 and o.cores > 0:
+        if (
+            o.is_matmul
+            and o.matmul_macs > 0
+            and (not isinstance(o.cores, int) or o.cores > 0)
+        ):
             # A coarse-tiled matmul appears to underfill the array MORE per tile than a
             # standalone one, but the current data (thin, non-current, partly U-shaped) is
             # too weak to fit -- so it is NOT modeled: tiled matmuls take pt_eff=1 (flagged;
