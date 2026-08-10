@@ -17,7 +17,6 @@ import math
 import time
 from collections.abc import Sequence
 from typing import Any, Optional
-from dataclasses import fields
 
 import sympy
 import torch
@@ -1470,6 +1469,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             op_features.append(self._extract_op_features(graph, output_name, bufmap))
 
         from torch_spyre._inductor.cost_model import predict_ops
+
         cost_expr = predict_ops(op_features)
         return self.layout_planning.plan_layout_and_core_divisions(buffers, cost_expr)
 
