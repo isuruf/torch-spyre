@@ -485,10 +485,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 if hasattr(expr, "num_exprs"):
                     # SumArray (e.g. from ``a + b + c`` or ``sum(...)``): flatten to
                     # a single offset + per-var coefficients and bound each term.
-                    try:
-                        flat = cp_model.FlatIntExpr(expr)
-                    except RuntimeError:
-                        flat = cp_model.FlatFloatExpr(expr)
+                    flat = cp_model.FlatIntExpr(expr)
                     lb = ub = flat.offset
                     for var, c in zip(flat.vars, flat.coeffs):
                         vlb, vub = affine_bounds(var)
@@ -500,7 +497,38 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 raise TypeError(f"unsupported expr type: {type(expr)}")
 
             print("Cost Expr", cost_expr)
+
+            def is_mul_constant(expr, func):
+                return isinstance(expr, sympy.Mul) and len(expr.args) == 2 and expr.args[-1].func == func and expr.args[0] > 0           
+            def unnest_min(expr):
+                # rewrites Min(4, 5*Min(x, y)) as Min(4, 5*x, 5*y)
+                result = []
+                func = expr.func
+                for arg in expr.args:
+                    if is_mul_constant(arg, func):
+                        result.extend([a*arg.args[0] for a in args[-1].args])
+                    elif isinstance(arg, sympy.Add):
+                        for i, a in enumerate(arg.args):
+                            if is_mul_constant(a, func):
+                                rest = sympy.Add(*(arg.args[:i] + arg.args[(i+1):]))
+                                result.extend([b * a.args[0] + rest for b in a.args[-1].args])
+                                break
+                        else:
+                            result.append(arg)
+                return func(*result)
+
+            def truncate_floats_min(expr):
+                # re-writes Min(x*0.5, y*0.5) as Min(x, y)/2
+                m = 10000
+                return expr.func(*[(arg*m).n().nsimplify(tolerance=1) for arg in expr.args])/m
+            
+            cost_expr = cost_expr.replace(
+                lambda e: e.func in [sympy.Min, sympy.Max], lambda e: unnest_min(e))
+            print("simplify 1", cost_expr)
+            cost_expr = cost_expr.replace(
+                lambda e: e.func in [sympy.Min, sympy.Max], lambda e: truncate_floats_min(e))
             count = 0
+            print("simplify 2", cost_expr)
 
             def my_max(*args):
                 nonlocal count
@@ -516,11 +544,17 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 nonlocal count
                 lb = min(affine_bounds(arg)[0] for arg in args)
                 ub = max(affine_bounds(arg)[1] for arg in args)
-                min_var = model.NewIntVar(lb, ub, f"min_var_{count}")
-                # min_var = model.NewIntVar(int(math.ceil(lb)), int(math.floor(ub)), f"min_var_{count}")
-                model.AddMinEquality(min_var, args)
-                count += 1
-                return min_var
+                if isinstance(lb, float) or isinstance(ub, float):
+                    import math
+                    min_var = model.NewIntVar(int(math.floor(lb*1000)), int(math.ceil(ub*1000)), f"min_var_{count}")
+                    model.AddMinEquality(min_var, args)
+                    count += 1
+                    return min_var*1e-3
+                else:
+                    min_var = model.NewIntVar(lb, ub, f"min_var_{count}")
+                    model.AddMinEquality(min_var, args)
+                    count += 1
+                    return min_var
 
             custom = {"max": my_max, "min": my_min}
 

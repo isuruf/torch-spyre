@@ -17,6 +17,7 @@ import math
 import time
 from collections.abc import Sequence
 from typing import Any, Optional
+from dataclasses import fields
 
 import sympy
 import torch
@@ -1469,7 +1470,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             op_features.append(self._extract_op_features(graph, output_name, bufmap))
 
         from torch_spyre._inductor.cost_model import predict_ops
-
         cost_expr = predict_ops(op_features)
         return self.layout_planning.plan_layout_and_core_divisions(buffers, cost_expr)
 
@@ -2170,7 +2170,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 is_lx=is_lx,
                 elems=out_elems,
                 dims=list(out_dims),
-                logical=list(out_size),
+                logical=out_size,
                 loop_factor=out_factor,
             )
         )
@@ -2227,7 +2227,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     elems=in_elems,
                     broadcast=broadcast,
                     dims=list(dims),
-                    logical=list(in_logical) if in_logical else [],
+                    logical=in_logical if in_logical else [],
                     loop_factor=in_factor,  # 1 if advancing, L if a fixed accumulator
                 )
             )

@@ -531,7 +531,10 @@ def _fused_hbm_bytes(ops: list) -> tuple:
         for a in o.args:
             b = a.elems * a.loop_factor * o.dtype_bytes * (1 - a.is_lx)
             if a.role == "input" and a.name.startswith("arg"):
-                ext_in[a.name] = max(ext_in.get(a.name, 0), b)
+                if a.name in ext_in:
+                    ext_in[a.name] = max(ext_in[a.name], b)
+                else:
+                    ext_in[a.name] = b
             elif a.role == "input":
                 r += b
             else:
