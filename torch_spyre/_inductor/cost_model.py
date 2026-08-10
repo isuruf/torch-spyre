@@ -123,8 +123,11 @@ Parameters live in :class:`CostParams`, calibrated from device measurements
 (``examples/run_cost_model_plan.sh``).
 """
 
+import builtins
 import dataclasses
 import math
+
+import sympy
 
 
 @dataclasses.dataclass
@@ -496,15 +499,22 @@ def mm_spill_frac(tile_area: float, params: CostParams | None = None) -> float:
     )
 
 
-import sympy
+def max(*args, **kwargs):
+    """``max``, but symbolic-aware: dispatches to ``sympy.Max`` when an arg is
+    a sympy expression (whose truth-valued comparisons the builtin can't
+    resolve), otherwise defers to the builtin -- including its ``key``/
+    ``default`` kwargs and single-iterable form, neither of which ``sympy.Max``
+    supports."""
+    if any(isinstance(a, sympy.Basic) for a in args):
+        return sympy.Max(*args)
+    return builtins.max(*args, **kwargs)
 
 
-def max(*args):
-    return sympy.Max(*args)
-
-
-def min(*args):
-    return sympy.Min(*args)
+def min(*args, **kwargs):
+    """``min`` counterpart of :func:`max`; see its docstring."""
+    if any(isinstance(a, sympy.Basic) for a in args):
+        return sympy.Min(*args)
+    return builtins.min(*args, **kwargs)
 
 
 def _fused_hbm_bytes(ops: list) -> tuple:
@@ -747,7 +757,10 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # compute/HBM OVERLAP: memory transfers pipeline with the systolic compute, so the
     # smaller of the two is partly hidden (gamma=0.46). For a non-matmul bundle compute=0
     # -> min(0, mem_t)=0 -> t = mem_t (unchanged).
-    t = compute + mem_t - p.overlap_gamma * min(compute, mem_t)
+    if compute == 0.0:
+        t = mem_t
+    else:
+        t = compute + mem_t - p.overlap_gamma * min(compute, mem_t)
     # (A genuine-reduction cross-core ring-combine term once lived here; it is provably
     # bounded by ~cores * a tiny per-elem cost <= ~5 ns -- below run-to-run noise --
     # so it is dropped as inert. K is never split for matmul, so there is no matmul analogue.

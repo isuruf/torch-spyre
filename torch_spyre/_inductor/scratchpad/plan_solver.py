@@ -17,7 +17,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional
 from abc import ABC, abstractmethod
+import itertools
 import math
+import sympy
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from enum import Enum
 
@@ -166,36 +168,37 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         )
 
     @property
-    def sym_is_lx(self) -> sympy.Symbol
+    def sym_is_lx(self) -> sympy.Symbol:
         return sympy.Symbol(f"is_lx_{self.name}")
 
     @property
-    def sym_inv_cores(self) -> sympy.Symbol
+    def sym_inv_cores(self) -> sympy.Symbol:
         return sympy.Symbol(f"inv_cores_{self.name}")
 
     @property
-    def sym_core_divs(self) -> tuple[dict, dict]
+    def sym_core_divs(self) -> tuple[dict, dict]:
+        """Symbolic stand-in for a chosen ``op_it_space_splits``: one symbol per
+        stride coefficient seen across this buffer's candidate divisions, so the
+        cost model can carry an undecided split as an unknown rather than a
+        concrete value."""
         core_divs = self.core_divisions
- 
+
         def unique(args):
             d = {arg: None for arg in args}
             return list(d)
- 
-        orig = op
-        op = copy.copy(op)
+
         output_keys = unique(
-            itertools.chain.from_iterable([cd.output_splits for cd in core_divs])
+            itertools.chain.from_iterable(cd.output_splits for cd in core_divs)
         )
         sym_output_splits = {
-            key: sympy.Symbol(f"output_split_{output_name}_{key}")
-            for key in output_keys
+            key: sympy.Symbol(f"output_split_{self.name}_{key}") for key in output_keys
         }
- 
+
         reduction_keys = unique(
-            itertools.chain.from_iterable([cd.output_splits for cd in core_divs])
+            itertools.chain.from_iterable(cd.reduction_splits for cd in core_divs)
         )
         sym_reduction_splits = {
-            key: sympy.Symbol(f"reduction_split_{output_name}_{key}")
+            key: sympy.Symbol(f"reduction_split_{self.name}_{key}")
             for key in reduction_keys
         }
         return (sym_output_splits, sym_reduction_splits)

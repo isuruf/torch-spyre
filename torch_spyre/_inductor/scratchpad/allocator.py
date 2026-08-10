@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import logging
 import math
 import time
@@ -50,7 +49,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
-    LifetimeBoundBufferWithSolverVars,
     MemoryPlanSolver,
     SolveError,
     BufferType,
@@ -159,7 +157,7 @@ class ScratchpadAllocator:
         self.reject_reasons = {}
         self._run_passes(self.pre_optimization_passes, graph)
         buffers = self._prepare_buffers(graph)
-        allocation = self._solve(buffers)
+        allocation = self._solve(buffers, graph)
         self._post_solve(graph, allocation)
         self._record_reject_reasons(allocation)
         self._push_allocation(graph, allocation)
@@ -177,7 +175,7 @@ class ScratchpadAllocator:
         """Buffers to hand the solver. Base: fixed-division LifetimeBoundBuffers."""
         return self._generate_buffers(graph)
 
-    def _solve(self, buffers: Sequence[Any]) -> Sequence[Any]:
+    def _solve(self, buffers: Sequence[Any], graph: GraphLowering) -> Sequence[Any]:
         """Assign LX addresses. Base: placement-only ``plan_layout``."""
         assert self.layout_planning is not None
         return self.layout_planning.plan_layout(buffers, log_lx_usage=True)
@@ -1453,13 +1451,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         self.layout_planning: Optional[CoreDivisionLayoutSolver] = layout_planning
 
     def _prepare_buffers(self, graph: GraphLowering) -> Sequence[Any]:
+        # Stashed for `_solve`, which the base `plan_allocation` template calls
+        # with only `buffers` -- it needs the graph to re-derive op features.
         in_place = self._determine_in_place_division_invariant(graph)
         buffers = self._build_cd_bound_buffers(
             graph, in_place, self._division_map(graph)
         )
         return buffers
 
-    def _solve(self, buffers: Sequence[Any]) -> Sequence[Any]:
+    def _solve(self, buffers: Sequence[Any], graph: GraphLowering) -> Sequence[Any]:
         assert self.layout_planning is not None
         bufmap = {buf.name: buf for buf in buffers}
 
@@ -1681,7 +1681,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         graph: GraphLowering,
         in_place: Optional[dict[str, list[str]]],
         divisions: dict[str, list[CoreDivision]],
-    ) -> list[LifetimeBoundBufferWithSolverVars]:
+    ) -> list[CoreDivisionBuffer]:
         """Build the ``CoreDivisionBuffer``s handed to the solver.
 
         Every buffer carries its candidate ``divisions`` and is sized by its
@@ -2082,8 +2082,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         op = graph.get_buffer(output_name)
         data = getattr(op, "data", None)
 
-        import itertools
-
         buf = buffers[output_name]
 
         op.op_it_space_splits = buf.sym_core_divs
@@ -2106,7 +2104,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         out_dims = _device_dims(op.get_layout()) or out_size
         out_elems = _prod_ints(out_dims)
 
-        cores = 1/buf.sym_inv_cores
+        cores = 1 / buf.sym_inv_cores
 
         def max(*args):
             return sympy.Max(*args)
@@ -2148,7 +2146,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # (rows/tile < col-sticks), leaving each core a full row tile (no underfill). 0.0 =
         # N/A -> no derate.
         tile_rows_per_core = 0.0
-        if tiles_out_dim and loop_trip > 1 and cores > 0 and len(out_dims) >= 2:
+        if tiles_out_dim and loop_trip > 1 and len(out_dims) >= 2:
             rows = out_dims[-2]
             # full-buffer alloc: per-tile slice is rows / loop_trip
             rows = rows / loop_trip * (1 - is_lx) + rows * is_lx
@@ -2215,7 +2213,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     )
                 inp_is_lx = False
             else:
-                inp_is_lx = buffers[name].sym_is_lx
+                # A resolved buffer not in `buffers` (e.g. a graph input never
+                # cloned at the boundary) isn't managed by the LX planner, so
+                # it can never be resident.
+                buf = buffers.get(name)
+                inp_is_lx = buf.sym_is_lx if buf is not None else False
 
             args.append(
                 ArgTraffic(
