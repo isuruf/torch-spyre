@@ -99,7 +99,7 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     materialize_lx_relayouts,
 )
 from torch_spyre._inductor.pass_utils import _is_matmul_op
-from torch_spyre._inductor.cost_model import predict_ops, CostParams
+from torch_spyre._inductor.cost_model import CostParams
 
 _COST_PARAMS = CostParams(
     # we need a expression of both compute, mem_t
@@ -1566,16 +1566,44 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         assert isinstance(solver, CoreDivisionLayoutSolver)
         bufmap = {buf.name: buf for buf in solver.buffers}
 
-        op_features = []
+        # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
+        # features to the ops in each estimated bundle. ``mem_usage_by_buf`` keys
+        # on ``op.name`` over ``graph.operations``, so every feature here belongs
+        # to an op the grouping will see -- a feature whose buffer is absent from
+        # ``graph.operations`` would silently drop out of the objective.
         mem_usage = mem_usage_by_buf(graph)
+        op_features = {}
         for output_name in mem_usage:
             if not isinstance(graph.get_buffer(output_name), ComputedBuffer):
                 continue
             if output_name not in bufmap:
                 continue
-            op_features.append(self._extract_op_features(graph, output_name, bufmap))
+            op_features[output_name] = self._extract_op_features(
+                graph, output_name, bufmap
+            )
 
-        cost_expr = sympy.sympify(predict_ops(op_features, params=_COST_PARAMS))
+        from torch_spyre._inductor.cost_model import predict_by_bundle
+
+        # Logged, not asserted: dropping a buffer from the objective changes what
+        # the solver optimizes without failing anything, so it has to be visible,
+        # but it is not worth killing a plan over. Empty today.
+        unscored = set(op_features) - {
+            getattr(op, "name", None) for op in graph.operations
+        }
+        if unscored:
+            logger.warning(
+                "cost objective omits %d buffer(s) absent from graph.operations: %s",
+                len(unscored),
+                sorted(unscored),
+            )
+
+        # Scored one estimated bundle at a time, not as a single whole-graph
+        # kernel: bundle membership decides input dedup, the arity derate and the
+        # underfill derate, so a graph that fuses into several kernels is
+        # mispriced when scored flat.
+        cost_expr = sympy.sympify(
+            predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS)
+        )
         result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
             "CoOptimizingAllocator does not support LX relayout"
