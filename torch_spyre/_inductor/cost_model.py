@@ -145,6 +145,7 @@ Parameters live in :class:`CostParams`, calibrated from device measurements
 
 import dataclasses
 import math
+from collections.abc import Mapping, Sequence
 
 import sympy
 
@@ -1672,6 +1673,81 @@ def _explain_matmul_bundled(lines: list, ops: list, p: CostParams) -> str:
         )
     lines.append(f"     => T_model = {t / 1000:.2f} us")
     return "\n".join(lines)
+
+
+def group_features_by_bundle(
+    operations: Sequence, features_by_buffer: Mapping[str, OpFeatures]
+) -> list[list[OpFeatures]]:
+    """Group caller-supplied per-op features into the bundles ``operations`` will become.
+
+    Callers usually hold one flat list of features and score it as a single
+    bundle. That is exact only when the graph really is one fused kernel.
+    :func:`predict_ops` scores one bundle at a time and bundle membership changes
+    the result: ``_fused_hbm_bytes`` deduplicates each distinct external input
+    across a bundle (a shared input is loaded from HBM once, re-reads served
+    on-chip), the pointwise arity derate counts the ops in the bundle, and the
+    underfill derate takes the bundle's worst tile. So a graph that fuses into
+    several kernels has to be grouped the same way to be scored correctly.
+
+    The grouping comes from :func:`fusion.estimate_bundles`, which shares the
+    policy of the real fusion pass. It is an *estimate*: it cannot see nodes that
+    scheduling creates later, so bundle membership can under-count (see
+    :func:`fusion.estimate_bundles` for the measured accuracy).
+
+    Features are supplied by the caller, keyed by BUFFER NAME (``op.name``, the
+    key :func:`scratchpad.utils.mem_usage_by_buf` also uses), because there is
+    more than one extractor: ``dump_cost_model.extract_op_features`` builds
+    concrete features from the IR, and ``ScratchpadAllocator._extract_op_features``
+    builds symbolic ones. This module must not pick one -- and cannot import
+    either without a cycle. Keying by name rather than by position also removes
+    any alignment contract: an op the caller could not model is simply absent
+    from the mapping, so it is skipped here, and a group left with no features is
+    dropped, so callers never see an empty bundle. A *positional* list could not
+    express that -- a caller whose list omits its unmodellable ops would have its
+    features silently misattributed to the wrong bundles.
+    """
+    # Deferred: ``fusion`` imports torch, and the rest of this module is
+    # deliberately torch-free so it can be loaded standalone from a plain file
+    # path with no package around it (notes/eval_model.py, notes/plot_report.py
+    # do exactly that -- a top-level relative import breaks them outright).
+    from .fusion import estimate_bundles
+
+    bundles: list[list[OpFeatures]] = []
+    for group in estimate_bundles(operations):
+        feats: list[OpFeatures] = []
+        for op in group:
+            # ``getattr``: an op the caller could not model may be an extern or
+            # fallback node carrying no buffer name at all. Either way -- no name,
+            # or a name with no features -- it is skipped.
+            name = getattr(op, "name", None)
+            if name is not None and name in features_by_buffer:
+                feats.append(features_by_buffer[name])
+        if feats:  # a group with no modellable ops is not a bundle
+            bundles.append(feats)
+    return bundles
+
+
+def predict_by_bundle(
+    operations: Sequence,
+    features_by_buffer: Mapping[str, OpFeatures],
+    params: CostParams | None = None,
+) -> float:
+    """Predicted latency (ns) for ``operations``, scored one bundle at a time.
+
+    The bundle-aware counterpart to ``predict_ops(all_features)``: each estimated
+    bundle is scored as its own fused kernel and the results summed, rather than
+    scoring the whole graph as a single kernel. See
+    :func:`group_features_by_bundle` for the mapping's contract and for the
+    limits of the estimate.
+
+    With symbolic (sympy) features this returns a sympy expression, so it can
+    stand in for :func:`predict_ops` as a solver objective. With no bundles at
+    all it returns ``0``.
+    """
+    return sum(
+        predict_ops(bundle, params)
+        for bundle in group_features_by_bundle(operations, features_by_buffer)
+    )
 
 
 def explain(ops: list, params: CostParams | None = None) -> str:
