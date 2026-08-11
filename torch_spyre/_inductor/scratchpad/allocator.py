@@ -1464,13 +1464,37 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         assert self.layout_planning is not None
         bufmap = {buf.name: buf for buf in buffers}
 
-        op_features = []
+        # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
+        # features to the ops in each estimated bundle. ``mem_usage_by_buf`` keys
+        # on ``op.name`` over ``graph.operations``, so every feature here belongs
+        # to an op the grouping will see -- a feature whose buffer is absent from
+        # ``graph.operations`` would silently drop out of the objective.
         mem_usage = mem_usage_by_buf(graph)
-        for output_name, info in mem_usage.items():
-            op_features.append(self._extract_op_features(graph, output_name, bufmap))
+        op_features = {
+            output_name: self._extract_op_features(graph, output_name, bufmap)
+            for output_name in mem_usage
+        }
 
-        from torch_spyre._inductor.cost_model import predict_ops
-        cost_expr = predict_ops(op_features)
+        from torch_spyre._inductor.cost_model import predict_by_bundle
+
+        # Logged, not asserted: dropping a buffer from the objective changes what
+        # the solver optimizes without failing anything, so it has to be visible,
+        # but it is not worth killing a plan over. Empty today.
+        unscored = set(op_features) - {
+            getattr(op, "name", None) for op in graph.operations
+        }
+        if unscored:
+            logger.warning(
+                "cost objective omits %d buffer(s) absent from graph.operations: %s",
+                len(unscored),
+                sorted(unscored),
+            )
+
+        # Scored one estimated bundle at a time, not as a single whole-graph
+        # kernel: bundle membership decides input dedup, the arity derate and the
+        # underfill derate, so a graph that fuses into several kernels is
+        # mispriced when scored flat.
+        cost_expr = predict_by_bundle(graph.operations, op_features)
         return self.layout_planning.plan_layout_and_core_divisions(buffers, cost_expr)
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
