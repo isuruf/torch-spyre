@@ -17,7 +17,6 @@ import math
 import time
 from collections.abc import Sequence
 from typing import Any, Optional
-from dataclasses import fields
 
 import sympy
 import torch
