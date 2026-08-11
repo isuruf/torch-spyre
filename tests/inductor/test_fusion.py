@@ -20,18 +20,24 @@ built on it.
 item type, so the grouping rule can be checked with plain integers, without a
 scheduler, a graph or a device.
 
-:func:`extract_features_by_bundle` is exercised with bare ``ComputedBuffer``
-instances (allocated via ``__new__``, with only the attributes the grouping
-consults) plus a stubbed ``extract_op_features``. Building real ones needs a
-compile, so these cover the bundling and skip/drop logic that this module adds,
-not the per-op feature extraction it delegates to.
+:func:`cost_model.group_features_by_bundle` is exercised with bare
+``ComputedBuffer`` instances (allocated via ``__new__``, with only the attributes
+the grouping consults) and a hand-built name-to-features mapping. Building real
+ones needs a compile, so these cover the bundling and skip/drop logic, not the
+per-op feature extraction the callers supply. Because features arrive as a
+mapping, "this op could not be modelled" is expressed by leaving its buffer name
+out -- no extractor and no patching involved.
+
+:func:`dump_cost_model.extract_features_by_bundle` is covered separately, with
+its extractor stubbed, since deciding *which* ops make it into the mapping is
+that wrapper's job.
 """
 
 import unittest
 from unittest import mock
 import torch
 from torch._inductor.ir import ComputedBuffer
-from torch_spyre._inductor import dump_cost_model
+from torch_spyre._inductor import cost_model, dump_cost_model
 from torch_spyre._inductor.constants import DEVICE_NAME
 from torch_spyre._inductor.fusion import estimate_bundles, group_contiguous_fusable
 
@@ -98,33 +104,33 @@ class TestGroupContiguousFusable(unittest.TestCase):
         self.assertEqual([item for group in groups for item in group], items)
 
 
-def _buffer(tag: str, device: str) -> ComputedBuffer:
+def _buffer(name: str, device: str) -> ComputedBuffer:
     """A bare ``ComputedBuffer`` carrying only what the grouping consults.
 
-    ``extract_op_features`` is stubbed out in these tests, so the buffer needs no
-    layout or loop body -- just to satisfy the ``isinstance`` check and answer
-    ``get_device()``.  ``tag`` identifies it in assertions.
+    No feature extraction happens in these tests, so the buffer needs no layout
+    or loop body -- just to satisfy the ``isinstance`` check, answer
+    ``get_device()``, and carry the buffer ``name`` the features are keyed by.
     """
     op = ComputedBuffer.__new__(ComputedBuffer)
-    op.tag = tag
+    op.name = name
     op.get_device = lambda: torch.device(device)
     return op
 
 
-def _spyre(tag: str) -> ComputedBuffer:
-    return _buffer(tag, DEVICE_NAME)
+def _spyre(name: str) -> ComputedBuffer:
+    return _buffer(name, DEVICE_NAME)
 
 
-def _cpu(tag: str) -> ComputedBuffer:
+def _cpu(name: str) -> ComputedBuffer:
     """A ComputedBuffer off-device: a bundle boundary that is still modellable."""
-    return _buffer(tag, "cpu")
+    return _buffer(name, "cpu")
 
 
 class _Extern:
     """Stands in for an extern/fallback op: not a ComputedBuffer at all."""
 
-    def __init__(self, tag: str):
-        self.tag = tag
+    def __init__(self, name: str):
+        self.name = name
 
 
 def _tags(bundles) -> list[list[str]]:
@@ -138,8 +144,109 @@ class _Feat:
         self.name = name
 
 
+def _feats(*names: str) -> dict[str, _Feat]:
+    """The mapping a caller would hand over: buffer name -> features."""
+    return {name: _Feat(name) for name in names}
+
+
+class TestGroupFeaturesByBundle(unittest.TestCase):
+    def test_bundles_align_with_estimate_bundles(self):
+        ops = [_spyre("a"), _spyre("b"), _Extern("x"), _spyre("c")]
+        bundles = cost_model.group_features_by_bundle(ops, _feats("a", "b", "c"))
+
+        # The extern op forms its own group, which has no features and is
+        # dropped; the two Spyre runs survive with their membership intact.
+        self.assertEqual(_tags(bundles), [["a", "b"], ["c"]])
+
+        # And that grouping is exactly what estimate_bundles reports, modulo the
+        # groups dropped for having no modellable ops.
+        estimated = [
+            [op.name for op in group if isinstance(op, ComputedBuffer)]
+            for group in estimate_bundles(ops)
+        ]
+        self.assertEqual([g for g in estimated if g], _tags(bundles))
+
+    def test_off_device_buffer_is_its_own_bundle(self):
+        # A CPU ComputedBuffer is a boundary, but unlike an extern op it is still
+        # modellable, so it survives as a single-op bundle between the two runs.
+        ops = [_spyre("a"), _cpu("m"), _spyre("b")]
+        bundles = cost_model.group_features_by_bundle(ops, _feats("a", "m", "b"))
+        self.assertEqual(_tags(bundles), [["a"], ["m"], ["b"]])
+
+    def test_empty_group_is_dropped(self):
+        # "b" is the only op in its group and has no features, so that group
+        # disappears rather than coming back as an empty bundle.
+        ops = [_spyre("a"), _cpu("b"), _spyre("c")]
+        bundles = cost_model.group_features_by_bundle(ops, _feats("a", "c"))
+        self.assertEqual(_tags(bundles), [["a"], ["c"]])
+        self.assertTrue(all(bundle for bundle in bundles))
+
+    def test_op_without_features_is_skipped_within_a_surviving_bundle(self):
+        ops = [_spyre("a"), _spyre("b"), _spyre("c")]
+        bundles = cost_model.group_features_by_bundle(ops, _feats("a", "c"))
+        self.assertEqual(_tags(bundles), [["a", "c"]])
+
+    def test_no_features_at_all_gives_no_bundles(self):
+        ops = [_spyre("a"), _spyre("b")]
+        self.assertEqual(cost_model.group_features_by_bundle(ops, {}), [])
+
+    def test_no_operations(self):
+        self.assertEqual(cost_model.group_features_by_bundle([], _feats("a")), [])
+
+    def test_features_for_absent_buffers_are_ignored(self):
+        # A mapping wider than the graph does not invent bundles: only ops that
+        # are actually in ``operations`` can contribute.
+        ops = [_spyre("a")]
+        bundles = cost_model.group_features_by_bundle(ops, _feats("a", "b", "c"))
+        self.assertEqual(_tags(bundles), [["a"]])
+
+    def test_ops_without_a_buffer_name_are_skipped(self):
+        # An op that carries no name at all cannot be looked up. It still forms a
+        # group boundary; it just contributes no features.
+        unnamed = ComputedBuffer.__new__(ComputedBuffer)
+        unnamed.get_device = lambda: torch.device(DEVICE_NAME)
+        self.assertIsNone(getattr(unnamed, "name", None))
+
+        ops = [_spyre("a"), unnamed, _spyre("b")]
+        bundles = cost_model.group_features_by_bundle(ops, _feats("a", "b"))
+        self.assertEqual(_tags(bundles), [["a", "b"]])
+
+
+class TestPredictByBundle(unittest.TestCase):
+    def test_sums_one_prediction_per_bundle(self):
+        ops = [_spyre("a"), _spyre("b"), _Extern("x"), _spyre("c")]
+        scored = []
+
+        def _predict(bundle, params=None):
+            scored.append([f.name for f in bundle])
+            return 10.0 * len(bundle)
+
+        with mock.patch.object(cost_model, "predict_ops", _predict):
+            total = cost_model.predict_by_bundle(ops, _feats("a", "b", "c"))
+
+        # Scored per bundle, not once over the flattened graph.
+        self.assertEqual(scored, [["a", "b"], ["c"]])
+        self.assertEqual(total, 30.0)
+
+    def test_params_reach_every_bundle(self):
+        ops = [_spyre("a"), _Extern("x"), _spyre("b")]
+        params = cost_model.CostParams()
+        seen = []
+
+        def _predict(bundle, p=None):
+            seen.append(p)
+            return 0.0
+
+        with mock.patch.object(cost_model, "predict_ops", _predict):
+            cost_model.predict_by_bundle(ops, _feats("a", "b"), params)
+        self.assertEqual(seen, [params, params])
+
+    def test_no_bundles_predicts_zero(self):
+        self.assertEqual(cost_model.predict_by_bundle([], _feats("a")), 0)
+
+
 def _features_of(op) -> _Feat:
-    return _Feat(op.tag)
+    return _Feat(op.get_name())
 
 
 def _unmodellable(_op):
@@ -147,55 +254,27 @@ def _unmodellable(_op):
 
 
 class TestExtractFeaturesByBundle(unittest.TestCase):
-    def test_bundles_align_with_estimate_bundles(self):
+    """The ``dump_cost_model`` wrapper: which ops make it into the mapping.
+
+    Only this layer decides that, so only this layer needs the extractor stubbed.
+    """
+
+    def test_extracts_and_groups(self):
         ops = [_spyre("a"), _spyre("b"), _Extern("x"), _spyre("c")]
         with mock.patch.object(dump_cost_model, "extract_op_features", _features_of):
             bundles = dump_cost_model.extract_features_by_bundle(ops)
-
-        # The extern op forms its own group, which yields no features and is
-        # dropped; the two Spyre runs survive with their membership intact.
         self.assertEqual(_tags(bundles), [["a", "b"], ["c"]])
 
-        # And that grouping is exactly what estimate_bundles reports, modulo the
-        # groups dropped for having no modellable ops.
-        estimated = [
-            [op.tag for op in group if isinstance(op, ComputedBuffer)]
-            for group in estimate_bundles(ops)
-        ]
-        self.assertEqual([g for g in estimated if g], _tags(bundles))
-
-    def test_off_device_buffer_is_its_own_bundle(self):
-        # A CPU ComputedBuffer is a boundary, but unlike an extern op it still
-        # extracts, so it survives as a single-op bundle between the two runs.
-        ops = [_spyre("a"), _cpu("m"), _spyre("b")]
-        with mock.patch.object(dump_cost_model, "extract_op_features", _features_of):
-            bundles = dump_cost_model.extract_features_by_bundle(ops)
-        self.assertEqual(_tags(bundles), [["a"], ["m"], ["b"]])
-
-    def test_empty_group_is_dropped(self):
-        # "b" is the only op in its group and cannot be modelled, so that group
-        # disappears rather than coming back as an empty bundle.
-        ops = [_spyre("a"), _cpu("b"), _spyre("c")]
-
-        def _fail_on_b(op):
-            if op.tag == "b":
-                raise ValueError("cannot model this op")
-            return _Feat(op.tag)
-
-        with mock.patch.object(dump_cost_model, "extract_op_features", _fail_on_b):
-            bundles = dump_cost_model.extract_features_by_bundle(ops)
-        self.assertEqual(_tags(bundles), [["a"], ["c"]])
-        self.assertTrue(all(bundle for bundle in bundles))
-
-    def test_unmodellable_op_is_skipped_within_a_surviving_bundle(self):
+    def test_unmodellable_op_is_left_out_of_the_mapping(self):
         ops = [_spyre("a"), _spyre("b"), _spyre("c")]
 
         def _fail_on_b(op):
-            if op.tag == "b":
+            if op.get_name() == "b":
                 raise ValueError("cannot model this op")
-            return _Feat(op.tag)
+            return _Feat(op.get_name())
 
         with mock.patch.object(dump_cost_model, "extract_op_features", _fail_on_b):
+            self.assertEqual(dump_cost_model.features_by_buffer(ops).keys(), {"a", "c"})
             bundles = dump_cost_model.extract_features_by_bundle(ops)
         self.assertEqual(_tags(bundles), [["a", "c"]])
 
@@ -210,30 +289,8 @@ class TestExtractFeaturesByBundle(unittest.TestCase):
     def test_non_computed_buffer_ops_are_skipped(self):
         ops = [_Extern("x"), _Extern("y")]
         with mock.patch.object(dump_cost_model, "extract_op_features", _features_of):
+            self.assertEqual(dump_cost_model.features_by_buffer(ops), {})
             self.assertEqual(dump_cost_model.extract_features_by_bundle(ops), [])
-
-
-class TestPredictByBundle(unittest.TestCase):
-    def test_sums_one_prediction_per_bundle(self):
-        ops = [_spyre("a"), _spyre("b"), _Extern("x"), _spyre("c")]
-        scored = []
-
-        def _predict(bundle):
-            scored.append([f.name for f in bundle])
-            return 10.0 * len(bundle)
-
-        with (
-            mock.patch.object(dump_cost_model, "extract_op_features", _features_of),
-            mock.patch.object(dump_cost_model, "predict_ops", _predict),
-        ):
-            total = dump_cost_model.predict_by_bundle(ops)
-
-        # Scored per bundle, not once over the flattened graph.
-        self.assertEqual(scored, [["a", "b"], ["c"]])
-        self.assertEqual(total, 30.0)
-
-    def test_no_bundles_predicts_zero(self):
-        self.assertEqual(dump_cost_model.predict_by_bundle([]), 0)
 
 
 if __name__ == "__main__":

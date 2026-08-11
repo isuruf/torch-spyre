@@ -30,8 +30,7 @@ import os
 from torch._inductor.ir import ComputedBuffer
 
 from .constants import BATCH_MATMUL_OP
-from .cost_model import ArgTraffic, OpFeatures, explain, predict_ops
-from .fusion import estimate_bundles
+from .cost_model import ArgTraffic, OpFeatures, explain, group_features_by_bundle
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 
 
@@ -463,51 +462,34 @@ def extract_features(operations: list) -> list:
     return feats
 
 
+def features_by_buffer(operations: list) -> dict[str, OpFeatures]:
+    """Build OpFeatures for every modellable op, keyed by buffer name.
+
+    The keyed counterpart to :func:`extract_features`, in the form
+    :func:`cost_model.group_features_by_bundle` consumes. Same best-effort logic:
+    non-``ComputedBuffer`` ops and ops that fail to model are left out, which is
+    what makes them skippable downstream.
+    """
+    feats: dict[str, OpFeatures] = {}
+    for op in operations:
+        if isinstance(op, ComputedBuffer):
+            try:
+                feats[op.get_name()] = extract_op_features(op)
+            except Exception:  # noqa: BLE001 - skip ops we can't model
+                continue
+    return feats
+
+
 def extract_features_by_bundle(operations: list) -> list[list[OpFeatures]]:
-    """Build OpFeatures grouped into the SuperDSC bundles ``operations`` will become.
+    """OpFeatures for ``operations``, grouped into the bundles they will become.
 
-    :func:`extract_features` returns one flat list, which callers then score as a
-    single bundle. That is exact only when the graph really is one fused kernel.
-    The cost model scores one bundle at a time and bundle membership changes the
-    result: ``_fused_hbm_bytes`` deduplicates each distinct external input across
-    a bundle (a shared input is loaded from HBM once, re-reads served on-chip),
-    the pointwise arity derate counts the ops in the bundle, and the underfill
-    derate takes the bundle's worst tile. So a graph that fuses into several
-    kernels needs its features grouped the same way.
-
-    The grouping comes from :func:`fusion.estimate_bundles`, which shares the
-    policy of the real fusion pass. It is an *estimate*: it cannot see nodes that
-    scheduling creates later, so bundle membership can under-count (see
-    :func:`fusion.estimate_bundles` for the measured accuracy).
-
-    Per-op extraction is the same best-effort logic as :func:`extract_features` --
-    non-``ComputedBuffer`` ops and ops that fail to model are skipped. A group
-    left empty by that skipping is dropped, so callers never see an empty bundle.
+    Convenience for callers that want this module's IR extractor and nothing
+    else; the grouping rule, and why it matters for scoring, live in
+    :func:`cost_model.group_features_by_bundle`. Score the result one bundle at a
+    time -- ``cost_model.predict_by_bundle(operations, features_by_buffer(ops))``
+    does both steps in one call.
     """
-    bundles: list[list[OpFeatures]] = []
-    for group in estimate_bundles(operations):
-        feats: list[OpFeatures] = []
-        for op in group:
-            if isinstance(op, ComputedBuffer):
-                try:
-                    feats.append(extract_op_features(op))
-                except Exception:  # noqa: BLE001 - skip ops we can't model
-                    continue
-        if feats:  # a group whose ops were all unmodellable is not a bundle
-            bundles.append(feats)
-    return bundles
-
-
-def predict_by_bundle(operations: list) -> float:
-    """Predicted latency (ns) for ``operations``, scored one bundle at a time.
-
-    The bundle-aware counterpart to ``predict_ops(extract_features(ops))``: each
-    estimated bundle is scored as its own fused kernel and the results summed,
-    rather than scoring the whole graph as a single kernel. See
-    :func:`extract_features_by_bundle` for why the grouping changes the result,
-    and for the limits of the estimate.
-    """
-    return sum(predict_ops(bundle) for bundle in extract_features_by_bundle(operations))
+    return group_features_by_bundle(operations, features_by_buffer(operations))
 
 
 # Totals + per-arg detail from the most recent extraction, using the DEVICE-layout
