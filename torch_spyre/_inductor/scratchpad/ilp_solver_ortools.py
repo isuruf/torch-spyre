@@ -310,6 +310,127 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars):
         self.buffer.chosen_division = solver.Value(self.division)
 
 
+class _SympyExprToCpSat:
+    """Translates a sympy cost expression into an OR-Tools CP-SAT expression
+    over an existing ``sympy symbol -> CP-SAT var`` mapping.
+
+    ``sympy.lambdify`` walks the expression tree and reconstructs it with
+    Python's ``+``/``-``/``*`` (which CP-SAT vars overload) plus the
+    ``min``/``max`` overrides supplied here, which materialize a new CP-SAT
+    var per ``Min``/``Max`` node via ``AddMinEquality``/``AddMaxEquality``.
+    Two rewrites run first so those overrides only ever see forms CP-SAT can
+    bound: :meth:`_unnest_min` distributes a constant multiplied through a
+    nested ``Min``/``Max`` (``Min(4, 5*Min(x, y))`` -> ``Min(4, 5*x, 5*y)``,
+    also through one ``Add`` term), and :meth:`_truncate_floats_min` snaps a
+    ``Min``/``Max``'s float coefficients to the rationals CP-SAT's integer
+    model can hold exactly.
+    """
+
+    def __init__(self, model: "cp_model.CpModel") -> None:
+        self._model = model
+        self._count = 0
+
+    def convert(self, cost_expr: sympy.Expr, sym_map: dict) -> object:
+        """Return the CP-SAT expression equivalent to ``cost_expr`` under
+        ``sym_map`` (``sympy symbol -> CP-SAT var``)."""
+        print("Cost Expr", cost_expr)
+        cost_expr = cost_expr.replace(
+            lambda e: e.func in [sympy.Min, sympy.Max],
+            lambda e: self._unnest_min(e),
+        )
+        print("simplify 1", cost_expr)
+        cost_expr = cost_expr.replace(
+            lambda e: e.func in [sympy.Min, sympy.Max],
+            lambda e: self._truncate_floats_min(e),
+        )
+        print("simplify 2", cost_expr)
+
+        custom = {"max": self._my_max, "min": self._my_min}
+        return sympy.lambdify(
+            list(sym_map.keys()), cost_expr, modules=[custom, "math"]
+        )(*sym_map.values())
+
+    @staticmethod
+    def _is_mul_constant(expr, func):
+        # check if an expression is of the form c*func() where c is positive
+        return (
+            isinstance(expr, sympy.Mul)
+            and len(expr.args) == 2
+            and expr.args[-1].func == func
+            and expr.args[0] > 0
+        )
+
+    @classmethod
+    def _unnest_min(cls, expr):
+        # rewrites Min(4, 5*Min(x, y)) as Min(4, 5*x, 5*y)
+        result = []
+        func = expr.func
+        for arg in expr.args:
+            if cls._is_mul_constant(arg, func):
+                result.extend([a * arg.args[0] for a in arg.args[-1].args])
+            elif isinstance(arg, sympy.Add):
+                for i, a in enumerate(arg.args):
+                    if cls._is_mul_constant(a, func):
+                        rest = sympy.Add(*(arg.args[:i] + arg.args[(i + 1) :]))
+                        result.extend([b * a.args[0] + rest for b in a.args[-1].args])
+                        break
+                else:
+                    result.append(arg)
+        return func(*result)
+
+    @staticmethod
+    def _truncate_floats_min(expr):
+        # re-writes Min(x*0.5, y*0.5) as Min(x, y)/2
+        m = 10000
+        return (
+            expr.func(*[(arg * m).n().nsimplify(tolerance=1) for arg in expr.args]) / m
+        )
+
+    @staticmethod
+    def _affine_bounds(expr):
+        if isinstance(expr, cp_model.IntVar):
+            return expr.domain.min(), expr.domain.max()
+        if isinstance(expr, (int, float)):
+            return expr, expr
+        if (
+            hasattr(expr, "coefficient")
+            and hasattr(expr, "offset")
+            and hasattr(expr, "expression")
+        ):
+            lb, ub = _SympyExprToCpSat._affine_bounds(expr.expression)
+            c, o = expr.coefficient, expr.offset
+            return (c * lb + o, c * ub + o) if c >= 0 else (c * ub + o, c * lb + o)
+        if hasattr(expr, "num_exprs"):
+            # SumArray (e.g. from ``a + b + c`` or ``sum(...)``): flatten to a
+            # single offset + per-var coefficients and bound each term.
+            flat = cp_model.FlatIntExpr(expr)
+            lb = ub = flat.offset
+            for var, c in zip(flat.vars, flat.coeffs):
+                vlb, vub = _SympyExprToCpSat._affine_bounds(var)
+                if c >= 0:
+                    lb, ub = lb + c * vlb, ub + c * vub
+                else:
+                    lb, ub = lb + c * vub, ub + c * vlb
+            return lb, ub
+        raise TypeError(f"unsupported expr type: {type(expr)}")
+
+    def _my_max(self, *args):
+        # max range is (max(mins), max(maxes))
+        bounds = map(max, zip(*[self._affine_bounds(arg) for arg in args]))
+        max_var = self._model.NewIntVar(*bounds, f"max_var_{self._count}")
+        self._model.AddMaxEquality(max_var, args)
+        self._count += 1
+        return max_var
+
+    def _my_min(self, *args):
+        # min range is (min(mins), min(maxes))
+        bounds = map(min, zip(*[self._affine_bounds(arg) for arg in args]))
+        min_var = self._model.NewIntVar(*bounds, f"min_var_{self._count}")
+        self._model.AddMinEquality(min_var, args)
+        self._count += 1
+        return min_var
+
+
 class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     """Joint core-division + LX placement via an OR-Tools CP-SAT search
     (``config.layout_solver == "cpsat"``). See the module docstring for the
@@ -466,128 +587,12 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         status = cp_model.INFEASIBLE
 
         if cost_expr is not None:
-
-            def affine_bounds(expr):
-                if isinstance(expr, cp_model.IntVar):
-                    return expr.domain.min(), expr.domain.max()
-                if isinstance(expr, (int, float)):
-                    return expr, expr
-                if (
-                    hasattr(expr, "coefficient")
-                    and hasattr(expr, "offset")
-                    and hasattr(expr, "expression")
-                ):
-                    lb, ub = affine_bounds(expr.expression)
-                    c, o = expr.coefficient, expr.offset
-                    return (
-                        (c * lb + o, c * ub + o) if c >= 0 else (c * ub + o, c * lb + o)
-                    )
-                if hasattr(expr, "num_exprs"):
-                    # SumArray (e.g. from ``a + b + c`` or ``sum(...)``): flatten to
-                    # a single offset + per-var coefficients and bound each term.
-                    flat = cp_model.FlatIntExpr(expr)
-                    lb = ub = flat.offset
-                    for var, c in zip(flat.vars, flat.coeffs):
-                        vlb, vub = affine_bounds(var)
-                        if c >= 0:
-                            lb, ub = lb + c * vlb, ub + c * vub
-                        else:
-                            lb, ub = lb + c * vub, ub + c * vlb
-                    return lb, ub
-                raise TypeError(f"unsupported expr type: {type(expr)}")
-
-            print("Cost Expr", cost_expr)
-
-            def is_mul_constant(expr, func):
-                # check if an expression is of the form c*func() where c is positive
-                return (
-                    isinstance(expr, sympy.Mul)
-                    and len(expr.args) == 2
-                    and expr.args[-1].func == func
-                    and expr.args[0] > 0
-                )
-
-            def unnest_min(expr):
-                # rewrites Min(4, 5*Min(x, y)) as Min(4, 5*x, 5*y)
-                result = []
-                func = expr.func
-                for arg in expr.args:
-                    if is_mul_constant(arg, func):
-                        result.extend([a * arg.args[0] for a in arg.args[-1].args])
-                    elif isinstance(arg, sympy.Add):
-                        for i, a in enumerate(arg.args):
-                            if is_mul_constant(a, func):
-                                rest = sympy.Add(*(arg.args[:i] + arg.args[(i + 1) :]))
-                                result.extend(
-                                    [b * a.args[0] + rest for b in a.args[-1].args]
-                                )
-                                break
-                        else:
-                            result.append(arg)
-                return func(*result)
-
-            def truncate_floats_min(expr):
-                # re-writes Min(x*0.5, y*0.5) as Min(x, y)/2
-                m = 10000
-                return (
-                    expr.func(
-                        *[(arg * m).n().nsimplify(tolerance=1) for arg in expr.args]
-                    )
-                    / m
-                )
-
-            cost_expr = cost_expr.replace(
-                lambda e: e.func in [sympy.Min, sympy.Max], lambda e: unnest_min(e)
-            )
-            print("simplify 1", cost_expr)
-            cost_expr = cost_expr.replace(
-                lambda e: e.func in [sympy.Min, sympy.Max],
-                lambda e: truncate_floats_min(e),
-            )
-            count = 0
-            print("simplify 2", cost_expr)
-
-            def my_max(*args):
-                nonlocal count
-                lb = min(affine_bounds(arg)[0] for arg in args)
-                ub = max(affine_bounds(arg)[1] for arg in args)
-                max_var = model.NewIntVar(lb, ub, f"max_var_{count}")
-                # max_var = model.NewIntVar(int(math.ceil(lb)), int(math.floor(ub)), f"max_var_{count}")
-                model.AddMaxEquality(max_var, args)
-                count += 1
-                return max_var
-
-            def my_min(*args):
-                nonlocal count
-                lb = min(affine_bounds(arg)[0] for arg in args)
-                ub = max(affine_bounds(arg)[1] for arg in args)
-                if isinstance(lb, float) or isinstance(ub, float):
-                    import math
-
-                    min_var = model.NewIntVar(
-                        int(math.floor(lb * 1000)),
-                        int(math.ceil(ub * 1000)),
-                        f"min_var_{count}",
-                    )
-                    model.AddMinEquality(min_var, args)
-                    count += 1
-                    return min_var * 1e-3
-                else:
-                    min_var = model.NewIntVar(lb, ub, f"min_var_{count}")
-                    model.AddMinEquality(min_var, args)
-                    count += 1
-                    return min_var
-
-            custom = {"max": my_max, "min": my_min}
-
             sym_map = {}
             for t in tensors.values():
                 sym_map[t.buffer.sym_is_lx] = t.in_buffer
                 sym_map[t.buffer.sym_inv_cores] = t.inv_cores
+            cp_cost = _SympyExprToCpSat(model).convert(cost_expr, sym_map)
 
-            cp_cost = sympy.lambdify(
-                list(sym_map.keys()), cost_expr, modules=[custom, "math"]
-            )(*sym_map.values())
             logger.debug("[CP-SAT layout solver] cost model expr: %s", cp_cost)
             model.minimize(cp_cost)
             status = solver.Solve(model)

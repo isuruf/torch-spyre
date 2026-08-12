@@ -2104,7 +2104,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         out_dims = _device_dims(op.get_layout()) or out_size
         out_elems = _prod_ints(out_dims)
 
-        cores = 1 / buf.sym_inv_cores
+        cores = 32 / buf.sym_inv_cores
 
         def max(*args):
             return sympy.Max(*args)
