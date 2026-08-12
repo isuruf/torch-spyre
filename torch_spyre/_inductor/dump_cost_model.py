@@ -30,7 +30,7 @@ import os
 from torch._inductor.ir import ComputedBuffer
 
 from .constants import BATCH_MATMUL_OP
-from .cost_model import ArgTraffic, OpFeatures, explain
+from .cost_model import ArgTraffic, OpFeatures, explain, group_features_by_bundle
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 
 
@@ -460,6 +460,36 @@ def extract_features(operations: list) -> list:
             except Exception:  # noqa: BLE001 - skip ops we can't model
                 continue
     return feats
+
+
+def features_by_buffer(operations: list) -> dict[str, OpFeatures]:
+    """Build OpFeatures for every modellable op, keyed by buffer name.
+
+    The keyed counterpart to :func:`extract_features`, in the form
+    :func:`cost_model.group_features_by_bundle` consumes. Same best-effort logic:
+    non-``ComputedBuffer`` ops and ops that fail to model are left out, which is
+    what makes them skippable downstream.
+    """
+    feats: dict[str, OpFeatures] = {}
+    for op in operations:
+        if isinstance(op, ComputedBuffer):
+            try:
+                feats[op.get_name()] = extract_op_features(op)
+            except Exception:  # noqa: BLE001 - skip ops we can't model
+                continue
+    return feats
+
+
+def extract_features_by_bundle(operations: list) -> list[list[OpFeatures]]:
+    """OpFeatures for ``operations``, grouped into the bundles they will become.
+
+    Convenience for callers that want this module's IR extractor and nothing
+    else; the grouping rule, and why it matters for scoring, live in
+    :func:`cost_model.group_features_by_bundle`. Score the result one bundle at a
+    time -- ``cost_model.predict_by_bundle(operations, features_by_buffer(ops))``
+    does both steps in one call.
+    """
+    return group_features_by_bundle(operations, features_by_buffer(operations))
 
 
 # Totals + per-arg detail from the most recent extraction, using the DEVICE-layout
