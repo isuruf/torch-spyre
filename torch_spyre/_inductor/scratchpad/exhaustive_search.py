@@ -69,16 +69,14 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
         # as well as through the joint entry point.
         return cast(
             "list[LifetimeBoundBuffer]",
-            self.plan_layout_and_core_divisions(log_lx_usage=log_lx_usage),
+            self.plan_layout_and_core_divisions(),
         )
 
     # ------------------------------------------------------------------
     # CoreDivisionLayoutSolver contract
     # ------------------------------------------------------------------
 
-    def plan_layout_and_core_divisions(
-        self, log_lx_usage: bool = False
-    ) -> list[CoreDivisionBuffer]:
+    def plan_layout_and_core_divisions(self) -> list[CoreDivisionBuffer]:
         buffers_list = cast("list[CoreDivisionBuffer]", self.buffers)
 
         buf_by_name: dict[str, CoreDivisionBuffer] = {b.name: b for b in buffers_list}
@@ -198,7 +196,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
 
         chosen = best_chosen
         final_solver = self._inner_factory(_make_temp_bufs(), self.limit)
-        final_alloc = final_solver.plan_layout(log_lx_usage=log_lx_usage)
+        final_alloc = final_solver.plan_layout()
         addr_by_name = {a.name: a.address for a in final_alloc}
         for b in buffers_list:
             b.address = addr_by_name.get(b.name)
