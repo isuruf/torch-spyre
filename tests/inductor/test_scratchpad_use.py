@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 import functools
 import itertools
+from types import SimpleNamespace
 from typing import Callable, TypeVarTuple, Unpack, Optional, override
 
 import unittest
@@ -30,6 +31,7 @@ from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor.pass_utils import op_read_writes
+from torch_spyre._inductor.patches import enable_spyre_context
 from torch_spyre._inductor.scratchpad.utils import calculate_liveness
 
 try:
@@ -47,6 +49,25 @@ Ts = TypeVarTuple("Ts")
 # where each split list is a sorted tuple of (iteration_space_stride, factor).
 _Splits = tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]
 _AllocEntry = tuple[str, int, _Splits]
+
+
+def test_nested_spyre_context_runs_pre_scheduling_once():
+    calls = []
+
+    class CountingPreSchedulingPasses:
+        def __call__(self, graph):
+            calls.append(graph)
+
+    graph = SimpleNamespace()
+    with (
+        patch.object(passes, "CustomPreSchedulingPasses", CountingPreSchedulingPasses),
+        patch.object(GraphLowering, "_update_scheduler", lambda _self: None),
+        enable_spyre_context([]),
+        enable_spyre_context([]),
+    ):
+        GraphLowering._update_scheduler(graph)
+
+    assert calls == [graph]
 
 
 class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):
@@ -1672,10 +1693,8 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         consumer ``p`` (whose result is itself read, so it is a realized candidate)
         reuses ``y``'s slot -- i.e. the output-feeding buffer is an in-place parent.
         This is a regression guard: if output in-place ever breaks, it fails here."""
-        from torch_spyre._inductor.scratchpad.allocator import (
-            ScratchpadAllocator,
-            _op_short_name,
-        )
+        from torch_spyre._inductor.pass_utils import op_short_name
+        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 
         x = self.rand_device((64, 1024))
 
@@ -1700,7 +1719,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                 output_feeders.add(name)
                 op = by_name.get(name)
                 # A graph output that is a clone pins the buffer it copies.
-                if op is not None and _op_short_name(op) == "clone":
+                if op is not None and op_short_name(op) == "clone":
                     output_feeders.update(d.name for d in op.get_read_writes().reads)
 
         with self.pre_scheduling_iterating_pass(collect_feeders):
@@ -1746,10 +1765,8 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         returned ``y`` is captured before its slot is overwritten. We assert the
         reuse edge is actually offered (the hazard is exercised, not vacuous) and
         that both returned values are correct."""
-        from torch_spyre._inductor.scratchpad.allocator import (
-            ScratchpadAllocator,
-            _op_short_name,
-        )
+        from torch_spyre._inductor.pass_utils import op_short_name
+        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 
         x = self.rand_device((64, 1024))
 
@@ -1775,7 +1792,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             for name in graph.get_output_names():
                 output_feeders.add(name)
                 op = by_name.get(name)
-                if op is not None and _op_short_name(op) == "clone":
+                if op is not None and op_short_name(op) == "clone":
                     output_feeders.update(d.name for d in op.get_read_writes().reads)
 
         with self.pre_scheduling_iterating_pass(collect_feeders):
@@ -1809,10 +1826,8 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         """Same aliasing hazard as the sibling test, exercised on the co-optimizing
         (joint CP-SAT) path: a returned buffer whose LX slot is reused in place must
         still be handed back to the caller intact (#3212)."""
-        from torch_spyre._inductor.scratchpad.allocator import (
-            CoOptimizingAllocator,
-            _op_short_name,
-        )
+        from torch_spyre._inductor.pass_utils import op_short_name
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 
         x = self.rand_device((64, 1024))
 
@@ -1838,7 +1853,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             for name in graph.get_output_names():
                 output_feeders.add(name)
                 op = by_name.get(name)
-                if op is not None and _op_short_name(op) == "clone":
+                if op is not None and op_short_name(op) == "clone":
                     output_feeders.update(d.name for d in op.get_read_writes().reads)
 
         with self.pre_scheduling_iterating_pass(collect_feeders):
@@ -1877,7 +1892,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         it in place, so it does not occupy a dedicated slot. We read the final LX
         allocations after the allocator runs and assert the input clone's address is
         shared by another LX buffer (and values are correct)."""
-        from torch_spyre._inductor.scratchpad.allocator import _op_short_name
+        from torch_spyre._inductor.pass_utils import op_short_name
 
         x = self.rand_device((64, 1024))
 
@@ -1894,7 +1909,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     graph.get_buffer(op.name).get_layout(), "allocation", {}
                 )
                 per_op[op.name] = {
-                    "short": _op_short_name(op),
+                    "short": op_short_name(op),
                     "lx": alloc.get("lx"),
                     "reads": [d.name for d in op.get_read_writes().reads],
                 }
