@@ -76,10 +76,13 @@ written once against whichever wrapper ``_wrap`` chose.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+import itertools
 from typing import TYPE_CHECKING, Generic, Optional, TypeVar, cast
+import sympy
 import torch
 
 
@@ -246,6 +249,9 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         when the division is fixed)."""
 
 
+_MAX_CORES = 32
+
+
 @dataclass
 class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer]):
     """The joint-model wrapper: a :class:`CoreDivisionBuffer` plus the vars for
@@ -268,15 +274,37 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         # reduction-axis split, so a reduction-parallel division counts its full
         # parallelism (``output_partition`` alone would score it as 1 core).
         cores_used = [cd.cores_used for cd in b.core_divisions]
+        # Inverse-core proxy for the cost-model objective,
+        # which needs 1/cores as a linear CP-SAT term: cost_expr's sym_inv_cores.
+        inv_cores_used = [_MAX_CORES // cd.cores_used for cd in b.core_divisions]
         self.division = m.new_int_var(0, len(b.core_divisions) - 1, f"div_{b.name}")
         self.eff_size = m.new_int_var(0, max(per_core), f"eff_size_{b.name}")
         # total cores this op uses under the chosen div
         self.cores = m.new_int_var(0, max(cores_used), f"occ_{b.name}")
+        self.inv_cores = m.new_int_var(0, max(inv_cores_used), f"inv_cores_{b.name}")
+
+        sym_core_divs = b.sym_core_divs
+        cp_log_core_divs = ({}, {})
+        for i, split_type in enumerate(["output_splits", "reduction_splits"]):
+            splits = sym_core_divs[i]
+            for key, symbol in splits.items():
+                values = [
+                    int(math.log2(getattr(cd, split_type).get(key, 1)))
+                    for cd in b.core_divisions
+                ]
+                cp_var = m.new_int_var(
+                    0, int(math.log2(_MAX_CORES)), f"log_{symbol.name}"
+                )
+                m.add_element(self.division, values, cp_var)
+                cp_log_core_divs[i][key] = cp_var
+
+        self.cp_log_core_divs = cp_log_core_divs
 
         # tie per-core footprint (output split only) and total core usage to the
         # chosen division index
         m.add_element(self.division, per_core, self.eff_size)
         m.add_element(self.division, cores_used, self.cores)
+        m.add_element(self.division, inv_cores_used, self.inv_cores)
 
     @property
     def parents(self) -> list[str]:
@@ -324,6 +352,168 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         self.buffer.chosen_division = solver.Value(self.division)
 
 
+class _SympyExprToCpSat:
+    """Translates a sympy cost expression into an OR-Tools CP-SAT expression
+    over an existing ``sympy symbol -> CP-SAT var`` mapping.
+    """
+
+    def __init__(self, model: "cp_model.CpModel") -> None:
+        self._model = model
+        self._count = 0
+
+    def convert(self, cost_expr: sympy.Expr, sym_map: dict) -> object:
+        """Return the CP-SAT expression equivalent to ``cost_expr`` under
+        ``sym_map`` (``sympy symbol -> CP-SAT var``)."""
+        print("Cost Expr", cost_expr)
+        # cost_expr = cost_expr.replace(
+        #     lambda e: e.func in [sympy.Min, sympy.Max],
+        #     lambda e: self._unnest_min(e),
+        # )
+        # print("simplify 1", cost_expr)
+        cost_expr = cost_expr.replace(
+            lambda e: e.func == sympy.log,
+            lambda e: self._log_min(e),
+        )
+        print("simplify 2", cost_expr)
+        cost_expr = sympy.expand(cost_expr)
+        print("simplify 3", cost_expr)
+        cost_expr = cost_expr.replace(
+            lambda e: e.func == sympy.log,
+            lambda e: self._log_split(e),
+        )
+        print("simplify 4", cost_expr)
+        cost_expr = cost_expr.replace(
+            lambda e: e.func in [sympy.Min, sympy.Max],
+            lambda e: self._truncate_floats_min(e),
+        )
+        print("simplify 5", cost_expr)
+        custom = {"max": self._my_max, "min": self._my_min}
+        return sympy.lambdify(
+            list(sym_map.keys()), cost_expr, modules=[custom, "math"]
+        )(*sym_map.values())
+
+    @staticmethod
+    def _is_mul_constant(expr, func):
+        # check if an expression is of the form c*func() where c is positive
+        return (
+            isinstance(expr, sympy.Mul)
+            and len(expr.args) == 2
+            and expr.args[-1].func == func
+            and expr.args[0] > 0
+        )
+
+    @classmethod
+    def _log_min(cls, expr):
+        # rewrite log(min(a, b)) as min(log(a), log(b))
+        arg = expr.args[0]
+        if isinstance(arg, (sympy.Min, sympy.Max)):
+            return arg.func(*[sympy.log(a) for a in arg.args])
+        else:
+            return expr
+
+    @classmethod
+    def _log_split(cls, expr):
+        arg = expr.args[0]
+        if isinstance(arg, sympy.Symbol) and "_split_" in arg.name:
+            return sympy.Symbol(
+                f"log_{arg.name}", integer=True, nonnegative=True
+            ) * sympy.log(2.0)
+        else:
+            return expr
+
+    @classmethod
+    def _unnest_min(cls, expr):
+        # rewrites Min(4, 5*Min(x, y)) as Min(4, 5*x, 5*y)
+        result = []
+        func = expr.func
+        values = []
+        for arg in expr.args:
+            if arg.func == func:
+                result.extend(arg.args)
+            elif cls._is_mul_constant(arg, func):
+                result.extend([a * arg.args[0] for a in arg.args[-1].args])
+            elif isinstance(arg, sympy.Add):
+                for i, a in enumerate(arg.args):
+                    if cls._is_mul_constant(a, func):
+                        values.extend([b * a.args[0] for b in a.args[-1].args])
+                    else:
+                        result.append(a)
+            else:
+                result.append(arg)
+        if values:
+            result.extend([sympy.Add(*m) for m in itertools.product(values)])
+        return func(*result)
+
+    @staticmethod
+    def _truncate_floats_min(expr):
+        # re-writes Min(x*0.5, y*0.5) as Min(x, y)/2
+        m = 10000
+        result = []
+        func = expr.func
+
+        def _process(expr):
+            if isinstance(expr, sympy.Mul) and isinstance(expr.args[0], sympy.Number):
+                a = (expr.args[0] * m).n().round()
+                r = sympy.Mul(a, *expr.args[1:])
+            elif isinstance(expr, sympy.Number):
+                r = (expr * m).round()
+            else:
+                r = expr * m
+            return r
+
+        for arg in expr.args:
+            if isinstance(arg, sympy.Add):
+                result.append(sympy.Add(*[_process(a) for a in arg.args]))
+            else:
+                result.append(_process(arg))
+
+        return func(*result) / m
+
+    @staticmethod
+    def _affine_bounds(expr):
+        if isinstance(expr, cp_model.IntVar):
+            return expr.domain.min(), expr.domain.max()
+        if isinstance(expr, (int, float)):
+            return expr, expr
+        if (
+            hasattr(expr, "coefficient")
+            and hasattr(expr, "offset")
+            and hasattr(expr, "expression")
+        ):
+            lb, ub = _SympyExprToCpSat._affine_bounds(expr.expression)
+            c, o = expr.coefficient, expr.offset
+            return (c * lb + o, c * ub + o) if c >= 0 else (c * ub + o, c * lb + o)
+        if hasattr(expr, "num_exprs"):
+            # SumArray (e.g. from ``a + b + c`` or ``sum(...)``): flatten to a
+            # single offset + per-var coefficients and bound each term.
+            flat = cp_model.FlatIntExpr(expr)
+            lb = ub = flat.offset
+            for var, c in zip(flat.vars, flat.coeffs):
+                vlb, vub = _SympyExprToCpSat._affine_bounds(var)
+                if c >= 0:
+                    lb, ub = lb + c * vlb, ub + c * vub
+                else:
+                    lb, ub = lb + c * vub, ub + c * vlb
+            return lb, ub
+        raise TypeError(f"unsupported expr type: {type(expr)}")
+
+    def _my_max(self, *args):
+        # max range is (max(mins), max(maxes))
+        bounds = map(max, zip(*[self._affine_bounds(arg) for arg in args]))
+        max_var = self._model.NewIntVar(*bounds, f"max_var_{self._count}")
+        self._model.AddMaxEquality(max_var, args)
+        self._count += 1
+        return max_var
+
+    def _my_min(self, *args):
+        # min range is (min(mins), min(maxes))
+        bounds = map(min, zip(*[self._affine_bounds(arg) for arg in args]))
+        min_var = self._model.NewIntVar(*bounds, f"min_var_{self._count}")
+        self._model.AddMinEquality(min_var, args)
+        self._count += 1
+        return min_var
+
+
 class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     """Joint core-division + LX placement via an OR-Tools CP-SAT search
     (``config.layout_solver == "cpsat"``). See the module docstring for the
@@ -364,7 +554,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         empty candidate list is placed here rather than divided."""
         return cast("list[LifetimeBoundBuffer]", list(self._plan_layout_generic()))
 
-    def plan_layout_and_core_divisions(self) -> list[CoreDivisionBuffer]:
+    def plan_layout_and_core_divisions(
+        self, cost_expr: sympy.Expr | None = None
+    ) -> list[CoreDivisionBuffer]:
         """Jointly choose each buffer's core division and its LX placement.
 
         The full model described in the module docstring. Every buffer must
@@ -374,7 +566,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         assert all(len(b.core_divisions) != 0 for b in buffers), (
             "All buffers must have at least 1 valid core division"
         )
-        return cast("list[CoreDivisionBuffer]", list(self._plan_layout_generic()))
+        return cast(
+            "list[CoreDivisionBuffer]",
+            list(self._plan_layout_generic(cost_expr=cost_expr)),
+        )
 
     def _wrap(
         self, model: "cp_model.CpModel", buffer: LifetimeBoundBuffer
@@ -390,15 +585,20 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         units = ceil_div(buffer.size, self.alignment)
         if isinstance(buffer, CoreDivisionBuffer) and buffer.core_divisions:
             return _CoreDivisionBufferWithCpVars(
-                replace(buffer, size=units), model, self._capacity_units
+                buffer=replace(buffer, size=units),
+                capacity_units=self._capacity_units,
+                model=model,
             )
         return _LifetimeBufferWithCpVars(
-            replace(buffer, size=units), model, self._capacity_units
+            buffer=replace(buffer, size=units),
+            capacity_units=self._capacity_units,
+            model=model,
         )
 
     def _plan_layout_generic(
         self,
         log_lx_usage: bool = False,
+        cost_expr: sympy.Expr | None = None,
     ) -> list[LifetimeBoundBuffer | CoreDivisionBuffer]:
         buffers = self.buffers
         if not buffers:
@@ -421,7 +621,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # Solve on copies so we never mutate the caller's buffers.
         working = {b.name: self._wrap(model, b) for b in buffers}
 
-        solved = self._run(model, working, forced_reasons)
+        solved = self._run(model, working, forced_reasons, cost_expr=cost_expr)
         # Surface a drop cause for every spilled buffer: the pre-solve forced
         # reason when we have one, otherwise the solver chose to spill it.
         self.spill_reasons = {
@@ -448,6 +648,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         model: "cp_model.CpModel",
         tensors: dict[str, _LifetimeBufferWithCpVars],
         forced_reasons: dict[str, str],
+        cost_expr: sympy.Expr | None,
     ) -> dict[str, LifetimeBoundBuffer]:
         children_of = self._get_children(tensors)
         self._add_inplace_relaxation(model, tensors)
@@ -462,34 +663,55 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0
 
-        # TODO: Update objective to a maxmin optimization to optimize overall
-        # throughput.
-        hbm_terms = [sb.spill_cost() * (1 - sb.in_buffer) for sb in tensors.values()]
         status = cp_model.INFEASIBLE
-        if hbm_terms:
-            model.minimize(sum(hbm_terms))
+
+        if cost_expr is not None:
+            sym_map = {}
+            for t in tensors.values():
+                sym_map[t.buffer.sym_is_lx] = t.in_buffer
+                sym_map[t.buffer.sym_inv_cores] = t.inv_cores
+                sym_core_divs = t.buffer.sym_core_divs
+                for splits, cp_splits in zip(sym_core_divs, t.cp_log_core_divs):
+                    for key, symbol in splits.items():
+                        sym_map[sympy.Symbol(f"log_{symbol.name}")] = cp_splits[key]
+
+            cp_cost = _SympyExprToCpSat(model).convert(cost_expr, sym_map)
+
+            logger.debug("[CP-SAT layout solver] cost model expr: %s", cp_cost)
+            model.minimize(cp_cost)
             status = solver.Solve(model)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError("CP-SAT memory planner found no feasible plan")
-            # Lock in the residency optimum (the traffic value, not just the
-            # count) so phase 2 can never trade a spill for parallelism.
+        else:
+            # TODO: Update objective to a maxmin optimization to optimize overall
+            # throughput.
+            hbm_terms = [
+                sb.spill_cost() * (1 - sb.in_buffer) for sb in tensors.values()
+            ]
+            if hbm_terms:
+                model.minimize(sum(hbm_terms))
+                status = solver.Solve(model)
+                if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                    raise SolveError("CP-SAT memory planner found no feasible plan")
+                # Lock in the residency optimum (the traffic value, not just the
+                # count) so phase 2 can never trade a spill for parallelism.
 
-            # Rounding avoids loss of precision as the objective function is
-            # the sum and multiplication of integers.
-            model.add(sum(hbm_terms) <= round(solver.ObjectiveValue()))
+                # Rounding avoids loss of precision as the objective function is
+                # the sum and multiplication of integers.
+                model.add(sum(hbm_terms) <= round(solver.ObjectiveValue()))
 
-        # Phase 2 -- parallelism: holding the residency optimum, maximize total
-        # core usage so every buffer (resident or spilled) takes its most
-        # parallel division. Placement-only buffers have no division to choose
-        # and so contribute no term; with none at all there is nothing to
-        # maximize, so we skip the re-solve and the extract below reads the
-        # phase-1 assignment still held by ``solver``.
-        core_terms = [sb.cores for sb in tensors.values() if sb.cores is not None]
-        if core_terms:
-            model.maximize(sum(core_terms))
-            status = solver.Solve(model)
-            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                raise SolveError("CP-SAT memory planner found no feasible plan")
+            # Phase 2 -- parallelism: holding the residency optimum, maximize total
+            # core usage so every buffer (resident or spilled) takes its most
+            # parallel division. Placement-only buffers have no division to choose
+            # and so contribute no term; with none at all there is nothing to
+            # maximize, so we skip the re-solve and the extract below reads the
+            # phase-1 assignment still held by ``solver``.
+            core_terms = [sb.cores for sb in tensors.values() if sb.cores is not None]
+            if core_terms:
+                model.maximize(sum(core_terms))
+                status = solver.Solve(model)
+                if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                    raise SolveError("CP-SAT memory planner found no feasible plan")
 
         final_tensors = self._extract(solver, tensors)
 

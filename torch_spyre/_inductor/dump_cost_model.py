@@ -30,7 +30,7 @@ import os
 from torch._inductor.ir import ComputedBuffer
 
 from .constants import BATCH_MATMUL_OP
-from .cost_model import ArgTraffic, OpFeatures, explain
+from .cost_model import ArgTraffic, OpFeatures, explain, max
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 
 
@@ -344,7 +344,7 @@ def _matmul_features(
                 if wc != 0:
                     out_vars.append((abs(int(wc)), s))
                 else:  # reduction (K) dim -> contributes to the K-split
-                    k_split *= max(1, int(readable.get(s, 1)))
+                    k_split *= max(1, readable.get(s, 1))
             if out_vars:
                 # Identify M (row/outer) and N (stick/inner), EXCLUDING batch. Prefer
                 # the exact named-dim map (present on work_div-hinted runs); else drop
@@ -368,10 +368,8 @@ def _matmul_features(
                     n_sym = mn[0][1] if len(mn) >= 2 else None
                 m_size = _int(it_space[m_sym], 1)
                 n_size = _int(it_space[n_sym], 1) if n_sym is not None else 1
-                m_split = max(1, int(readable.get(m_sym, 1)))
-                n_split = (
-                    max(1, int(readable.get(n_sym, 1))) if n_sym is not None else 1
-                )
+                m_split = max(1, readable.get(m_sym, 1))
+                n_split = max(1, readable.get(n_sym, 1)) if n_sym is not None else 1
                 if m_size > 1:
                     rows_per_core = m_size / m_split
                 if n_size > 1:
@@ -576,7 +574,7 @@ def extract_op_features(op) -> OpFeatures:
         ArgTraffic(
             name=op.get_operation_name(),
             role="output",
-            mem=out_mem,
+            is_lx=(out_mem == "lx"),
             elems=out_elems,
             dims=list(out_dims),
             logical=list(out_size),
@@ -620,7 +618,7 @@ def extract_op_features(op) -> OpFeatures:
             ArgTraffic(
                 name=name,
                 role="input",
-                mem=mem,
+                is_lx=(mem == "lx"),
                 elems=in_elems,
                 broadcast=broadcast,
                 dims=list(dims),

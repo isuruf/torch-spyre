@@ -137,8 +137,11 @@ Parameters live in :class:`CostParams`, calibrated from device measurements
 (``examples/run_cost_model_plan.sh``).
 """
 
+import builtins
 import dataclasses
 import math
+
+import sympy
 
 
 @dataclasses.dataclass
@@ -147,7 +150,7 @@ class ArgTraffic:
 
     name: str
     role: str  # "input" | "output"
-    mem: str  # "lx" | "hbm"
+    is_lx: bool
     elems: int  # device element count = prod(dims) (its own one-load size)
     broadcast: bool = False  # loaded once & reused across the broadcast dim
     # DEVICE (stick) shape, e.g. [4, 512, 64]
@@ -161,6 +164,12 @@ class ArgTraffic:
     # at one address across the loop (a per-tile accumulator re-read/written each
     # iteration). LX-resident args are ~free regardless (excluded from read/write).
     loop_factor: int = 1
+
+    @property
+    def mem(self) -> str:
+        if isinstance(self.is_lx, bool):
+            return "lx" if self.is_lx else "hbm"
+        raise ValueError("Symbolic is_lx not supported for this operation")
 
 
 @dataclasses.dataclass
@@ -220,9 +229,9 @@ class OpFeatures:
         """
         return (
             sum(
-                a.elems * a.loop_factor
+                a.elems * a.loop_factor * (1 - a.is_lx)
                 for a in self.args
-                if a.mem == "hbm" and a.role == "input"
+                if a.role == "input"
             )
             * self.dtype_bytes
         )
@@ -231,9 +240,9 @@ class OpFeatures:
         """HBM bytes WRITTEN (output args), scaled by ``loop_factor``."""
         return (
             sum(
-                a.elems * a.loop_factor
+                a.elems * a.loop_factor * (1 - a.is_lx)
                 for a in self.args
-                if a.mem == "hbm" and a.role == "output"
+                if a.role == "output"
             )
             * self.dtype_bytes
         )
@@ -243,7 +252,7 @@ class OpFeatures:
         return self.read_bytes() + self.write_bytes()
 
     def lx_bytes(self) -> int:
-        return sum(a.elems for a in self.args if a.mem == "lx") * self.dtype_bytes
+        return sum(a.elems * a.is_lx for a in self.args) * self.dtype_bytes
 
 
 def op_to_dict(op: "OpFeatures") -> dict:
@@ -444,6 +453,7 @@ class CostParams:
     # overlap fraction > 1.0, which is physically impossible and means the re-read is
     # over-charged rather than the overlap under-modelled.
     loop_reread_scale: float = 0.85
+    overlap_gamma: float = 1.0  # compute/HBM overlap: min(compute,HBM) partly hidden
     # Matmul operand RE-READ (tile spill): the per-core OUTPUT-accumulator tile has area
     # (M/m)*(N/n); once it exceeds the on-chip capacity (~64K fp16 elems/core) it no
     # longer stays resident, so the operands are re-streamed from HBM. The re-read
@@ -709,7 +719,8 @@ def underfill_eff(
         return 1.0
     tp = p.underfill_target_passes_pointwise if target_passes is None else target_passes
     r_full = p.underfill_pass_rows * tp
-    if r_full <= 0:
+    if r_full <= 1.0:
+        # when r_full <= 1.0, rows_per_core / r_full >=1.0, resulting in 1.0
         return 1.0
     return min(1.0, (rows_per_core / r_full) ** p.underfill_exponent)
 
@@ -943,8 +954,33 @@ def mm_spill_frac(tile_area: float, params: CostParams | None = None) -> float:
         return 0.0
     return min(
         p.mm_spill_cap,
-        p.mm_spill_slope * math.log2(max(1.0, tile_area / p.mm_spill_area0)),
+        p.mm_spill_slope * log2(max(1.0, tile_area / p.mm_spill_area0)),
     )
+
+
+def max(*args, **kwargs):
+    """``max``, but symbolic-aware: dispatches to ``sympy.Max`` when an arg is
+    a sympy expression (whose truth-valued comparisons the builtin can't
+    resolve), otherwise defers to the builtin -- including its ``key``/
+    ``default`` kwargs and single-iterable form, neither of which ``sympy.Max``
+    supports."""
+    if any(isinstance(a, sympy.Basic) for a in args):
+        return sympy.Max(*args)
+    return builtins.max(*args, **kwargs)
+
+
+def min(*args, **kwargs):
+    """``min`` counterpart of :func:`max`; see its docstring."""
+    if any(isinstance(a, sympy.Basic) for a in args):
+        return sympy.Min(*args)
+    return builtins.min(*args, **kwargs)
+
+
+def log2(arg):
+    """``log2`` counterpart of :func:`max`; see its docstring."""
+    if isinstance(arg, sympy.Basic):
+        return sympy.log(arg) / sympy.log(2.0)
+    return math.log2(arg)
 
 
 def _fused_hbm_bytes(ops: list) -> tuple:
@@ -959,11 +995,12 @@ def _fused_hbm_bytes(ops: list) -> tuple:
     ext_in: dict = {}  # external input name -> its one-load HBM bytes (dedup across ops)
     for o in ops:
         for a in o.args:
-            if a.mem != "hbm":
-                continue
-            b = a.elems * a.loop_factor * o.dtype_bytes
+            b = a.elems * a.loop_factor * o.dtype_bytes * (1 - a.is_lx)
             if a.role == "input" and a.name.startswith("arg"):
-                ext_in[a.name] = max(ext_in.get(a.name, 0), b)
+                if a.name in ext_in:
+                    ext_in[a.name] = max(ext_in[a.name], b)
+                else:
+                    ext_in[a.name] = b
             elif a.role == "input":
                 r += b
             else:
@@ -1090,7 +1127,7 @@ def broadcast_bw(o, p):
         qa, qb, qc, qe = p.cbc_q_a, p.cbc_q_b, p.cbc_q_c, p.cbc_q_e
         vp, vf, vbl, vbr = p.cbc_v_plateau, p.cbc_v_floor, p.cbc_v_bl, p.cbc_v_br
         s_lo, s_hi, q_hi = 95.0, 130.0, 120.0
-    lr, lc = math.log2(rows), math.log2(cols)
+    lr, lc = log2(rows), log2(cols)
     if rows >= p.bcast_bw_min_rows:  # well-filled: gentle decline with both dims
         return max(s_lo, min(s_hi, sa - sb * lc - sd * lr))
     if (
@@ -1190,12 +1227,12 @@ def transport_bw(o, p, kind):
     if rows <= 0 or cols <= 0:
         return fl
     sp = max(1.0, cols / 64.0)
-    bw = a - b * math.log2(sp) - d * math.log2(max(2, rows))
+    bw = a - b * log2(sp) - d * log2(max(2, rows))
     bw = min(p.bw_peak_gbps, max(fl, bw))
     if kind == "transpose_outer":
         m = _transport_outer_m(o)
         if m and m < p.tx_touter_m_ref:
-            bw -= p.tx_touter_m_penalty_gbps * math.log2(p.tx_touter_m_ref / m)
+            bw -= p.tx_touter_m_penalty_gbps * log2(p.tx_touter_m_ref / m)
             bw = max(p.tx_touter_m_floor_gbps, bw)
     return bw
 
@@ -1229,10 +1266,10 @@ def _reduction_bw_cores_factor(cores, p):
     if cores <= 1:
         return g[1]
     ks = sorted(g)
-    lc = math.log2(cores)
+    lc = log2(cores)
     for a, b in zip(ks, ks[1:]):
         if a <= cores <= b:
-            la, lb = math.log2(a), math.log2(b)
+            la, lb = log2(a), log2(b)
             return g[a] + (g[b] - g[a]) * (lc - la) / (lb - la)
     return 1.0
 
@@ -1268,13 +1305,14 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
             return transport_bw(o, p, "cat0")
         if pat in _pat_bw:  # restickify (transpose), reduce_outer (sumcol)
             return _pat_bw[pat]
-        if _is_broadcast_op(o):
-            return broadcast_bw(o, p)
-        kind = _transport_kind(
-            o
-        )  # cat1 / transpose_outer -- untagged, detected structurally
-        if kind:
-            return transport_bw(o, p, kind)
+        # TODO: make symbolic
+        # if _is_broadcast_op(o):
+        #    return broadcast_bw(o, p)
+        # kind = _transport_kind(
+        #     o
+        # )  # cat1 / transpose_outer -- untagged, detected structurally
+        # if kind:
+        #     return transport_bw(o, p, kind)
         return None
 
     # Only the fused-reduction branch below raises this; every other path leaves it at 0
@@ -1410,7 +1448,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # MATMUL compute = MACs/cores derated by pt_eff (PT-array fill).
     compute = 0.0
     for o in ops:
-        if o.is_matmul and o.matmul_macs > 0 and o.cores > 0:
+        if o.is_matmul and o.matmul_macs > 0:
             # A coarse-tiled matmul appears to underfill the array MORE per tile than a
             # standalone one, but the current data (thin, non-current, partly U-shaped)
             # is too weak to fit -- so it is NOT modeled: tiled matmuls take pt_eff=1
@@ -1434,7 +1472,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # and small tiles.
     split_ns = 0.0
     for o in ops:
-        if o.is_matmul and o.cores > 0:
+        if o.is_matmul:
             m_dev = o.matmul_rows_per_core * o.matmul_m_split
             n_dev = o.matmul_cols_per_core * o.matmul_n_split
             if m_dev >= n_dev:  # M is the longer output dim
@@ -1446,9 +1484,9 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
             )
             split_us = area_exc * (
                 p.mm_split_reread_us_per_elem
-                * max(0.0, math.log2(max(1, long_fan) / p.mm_split_long_knee))
+                * max(0.0, log2(long_fan) - log2(p.mm_split_long_knee))
                 + p.mm_split_short_us_per_elem
-                * max(0.0, math.log2(max(1, short_fan) / p.mm_split_short_knee))
+                * max(0.0, log2(short_fan) - log2(p.mm_split_short_knee))
             )
             split_ns += split_us * 1000.0  # us -> ns
     # compute/HBM OVERLAP: the engine streams operands while the systolic array works,
@@ -1469,6 +1507,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # OVERLAP: the engine streams operands while the array works, so a kernel takes the
     # LONGER of the two rather than their sum.
     t = max(compute, mem_t) + split_ns
+    t = compute + mem_t - p.overlap_gamma * min(compute, mem_t) + split_ns
     # (A genuine-reduction cross-core ring-combine term once lived here; it is provably
     # bounded by ~cores * a tiny per-elem cost <= ~5 ns -- below run-to-run noise --
     # so it is dropped as inert. K is never split for matmul, so there is no matmul
@@ -1495,13 +1534,13 @@ def explain(ops: list, params: CostParams | None = None) -> str:
         for a in o.args:
             bc = " broadcast (loaded once)" if a.broadcast else ""
             lf = f" xL={a.loop_factor}" if a.loop_factor > 1 else ""
-            counted = a.elems * a.loop_factor * o.dtype_bytes if a.mem == "hbm" else 0
+            counted = a.elems * a.loop_factor * o.dtype_bytes * (1 - a.is_lx)
             dev = a.dims if a.dims else [a.elems]
             log = f"torch {a.logical} -> " if a.logical else ""
             # One line per DEVICE-LAYOUT tensor: name, role, logical->device dims,
             # residency, byte calc, the HBM bytes the model counts, and the loop factor.
             lines.append(
-                f"      {a.role:<6} {a.name:<22} {log}device {dev} in {a.mem.upper()}"
+                f"      {a.role:<6} {a.name:<22} {log}device {dev} in {a.is_lx}"
                 f"  | {a.elems} elems x {o.dtype_bytes}B = {a.elems * o.dtype_bytes} B"
                 f" (hbm counted: {counted} B){lf}{bc}"
             )
@@ -1603,9 +1642,9 @@ def explain(ops: list, params: CostParams | None = None) -> str:
             )
             split_us += area_exc * (
                 p.mm_split_reread_us_per_elem
-                * max(0.0, math.log2(max(1, int(lf)) / p.mm_split_long_knee))
+                * max(0.0, log2(lf) - log2(p.mm_split_long_knee))
                 + p.mm_split_short_us_per_elem
-                * max(0.0, math.log2(max(1, int(sf)) / p.mm_split_short_knee))
+                * max(0.0, log2(sf) - log2(p.mm_split_short_knee))
             )
     if split_us > 0:
         lines.append(
