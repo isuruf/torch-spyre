@@ -29,14 +29,16 @@ import os
 
 from torch._inductor.ir import ComputedBuffer
 
+from torch_spyre._inductor import config
+
 from .constants import BATCH_MATMUL_OP
 from .cost_model import ArgTraffic, OpFeatures, explain, max
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 
-from typing import Optional, TYPE_CHECKING
+from typing import Mapping, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from torch._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+    from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
 
 def cost_dump_enabled() -> bool:
@@ -463,10 +465,11 @@ def _hbm_pattern(op, is_reduction: bool, out_dims) -> str:
 
 
 def extract_op_features(
-    op, buffers: Optional["LifetimeBoundBuffer"] = None
+    op, buffers: Optional[Mapping[str, "LifetimeBoundBuffer"]] = None
 ) -> OpFeatures:
     """Build OpFeatures for one ComputedBuffer op (best-effort).
-    buffers is an optional list used for creatng a symbolic cost model.
+    buffers is an optional name -> LifetimeBoundBuffer map used for creating a
+    symbolic cost model.
     """
     output_name = op.get_operation_name()
     buf = buffers.get(output_name) if buffers else None
@@ -488,7 +491,7 @@ def extract_op_features(
     out_dims = _device_dims(op.get_layout()) or out_size
     out_elems = _prod_ints(out_dims)
 
-    cores = 32 / buf.sym_inv_cores if buf else _cores(op)
+    cores = config.sencores / buf.sym_inv_cores if buf else _cores(op)
 
     # Cross-core ring combine: work division splits OUTPUT dims first, then the reduced
     # axis with leftover cores -> the reduced axis is split only when out_elems < cores.
@@ -629,7 +632,7 @@ def extract_op_features(
         else:
             if buffers:
                 inp_buf = buffers.get(name)
-                inp_is_lx = inp_buf.sym_is_lx if inp_buf is not None else False
+                inp_is_lx = inp_buf.sym_is_lx if inp_buf is not None else (mem == "lx")
             else:
                 inp_is_lx = mem == "lx"
         args.append(

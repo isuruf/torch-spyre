@@ -1552,7 +1552,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         op_features = []
         mem_usage = mem_usage_by_buf(graph)
-        for output_name, info in mem_usage.items():
+        for output_name in mem_usage:
+            if not isinstance(graph.get_buffer(output_name), ComputedBuffer):
+                continue
+            if output_name not in bufmap:
+                continue
             op_features.append(self._extract_op_features(graph, output_name, bufmap))
 
         from torch_spyre._inductor.cost_model import predict_ops, CostParams
@@ -1591,7 +1595,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             op.op_it_space_splits = buffers[output_name].sym_core_divs
             return extract_op_features(op, buffers)
         finally:
-            if orig_op_it_space_splits:
+            if orig_op_it_space_splits is None:
+                del op.op_it_space_splits
+            else:
                 op.op_it_space_splits = orig_op_it_space_splits
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:

@@ -929,6 +929,9 @@ def _matmul_mac_peak(o, params: "CostParams") -> float:
             else params.bmm_3d2d_mac_peak_hi_ns
         )
     b, a_def, b_def = _bmm_layout_pair(o)
+    if isinstance(o.cores, sympy.Basic):
+        # TODO: make symbolic
+        return params.mac_peak_per_core_ns
     if b < params.bmm_default_min_batch or o.cores < params.bmm_default_min_cores:
         return params.mac_peak_per_core_ns
     if a_def and b_def:
@@ -979,7 +982,7 @@ def min(*args, **kwargs):
 def log2(arg):
     """``log2`` counterpart of :func:`max`; see its docstring."""
     if isinstance(arg, sympy.Basic):
-        return sympy.log(arg) / sympy.log(2.0)
+        return sympy.log(arg, base=2.0)
     return math.log2(arg)
 
 
@@ -1261,6 +1264,9 @@ def _reduction_bw_cores_factor(cores, p):
     with `cores` active cores. Piecewise-linear in log2(cores) over the measured anchor
     table; 1.0 at cores>=32 (or unknown) so the cores=32 gold path is unchanged."""
     g = p.red_bw_cores_g
+    if isinstance(cores, sympy.Basic):
+        # TODO: make symbolic
+        return 1.0
     if cores is None or cores >= 32:
         return 1.0
     if cores <= 1:
@@ -1305,14 +1311,16 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
             return transport_bw(o, p, "cat0")
         if pat in _pat_bw:  # restickify (transpose), reduce_outer (sumcol)
             return _pat_bw[pat]
-        # TODO: make symbolic
-        # if _is_broadcast_op(o):
-        #    return broadcast_bw(o, p)
-        # kind = _transport_kind(
-        #     o
-        # )  # cat1 / transpose_outer -- untagged, detected structurally
-        # if kind:
-        #     return transport_bw(o, p, kind)
+        if any(isinstance(a.is_lx, sympy.Basic) for a in o.args):
+            # TODO: make symbolic
+            return None
+        if _is_broadcast_op(o):
+            return broadcast_bw(o, p)
+        kind = _transport_kind(
+            o
+        )  # cat1 / transpose_outer -- untagged, detected structurally
+        if kind:
+            return transport_bw(o, p, kind)
         return None
 
     # Only the fused-reduction branch below raises this; every other path leaves it at 0
@@ -1448,7 +1456,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # MATMUL compute = MACs/cores derated by pt_eff (PT-array fill).
     compute = 0.0
     for o in ops:
-        if o.is_matmul and o.matmul_macs > 0:
+        if o.is_matmul:
             # A coarse-tiled matmul appears to underfill the array MORE per tile than a
             # standalone one, but the current data (thin, non-current, partly U-shaped)
             # is too weak to fit -- so it is NOT modeled: tiled matmuls take pt_eff=1
@@ -1475,6 +1483,9 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         if o.is_matmul:
             m_dev = o.matmul_rows_per_core * o.matmul_m_split
             n_dev = o.matmul_cols_per_core * o.matmul_n_split
+            if isinstance(m_dev, sympy.Basic) or isinstance(n_dev, sympy.Basic):
+                # TODO: make symbolic
+                continue
             if m_dev >= n_dev:  # M is the longer output dim
                 long_fan, short_fan = o.matmul_m_split, o.matmul_n_split
             else:
@@ -1506,7 +1517,6 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # regresses mmwd 15.1 -> 17.6 and bmm_layout 20.2 -> 25.5. Compute and memory
     # OVERLAP: the engine streams operands while the array works, so a kernel takes the
     # LONGER of the two rather than their sum.
-    t = max(compute, mem_t) + split_ns
     t = compute + mem_t - p.overlap_gamma * min(compute, mem_t) + split_ns
     # (A genuine-reduction cross-core ring-combine term once lived here; it is provably
     # bounded by ~cores * a tiny per-elem cost <= ~5 ns -- below run-to-run noise --
@@ -1537,10 +1547,14 @@ def explain(ops: list, params: CostParams | None = None) -> str:
             counted = a.elems * a.loop_factor * o.dtype_bytes * (1 - a.is_lx)
             dev = a.dims if a.dims else [a.elems]
             log = f"torch {a.logical} -> " if a.logical else ""
+            try:
+                mem_repr = a.mem.upper()
+            except ValueError:
+                mem_repr = str(a.is_lx)
             # One line per DEVICE-LAYOUT tensor: name, role, logical->device dims,
             # residency, byte calc, the HBM bytes the model counts, and the loop factor.
             lines.append(
-                f"      {a.role:<6} {a.name:<22} {log}device {dev} in {a.is_lx}"
+                f"      {a.role:<6} {a.name:<22} {log}device {dev} in {mem_repr}"
                 f"  | {a.elems} elems x {o.dtype_bytes}B = {a.elems * o.dtype_bytes} B"
                 f" (hbm counted: {counted} B){lf}{bc}"
             )
@@ -1569,7 +1583,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     # Matmul compute (additive): sum the per-op compute term for any matmul ops.
     mm_us, mm_lines = 0.0, []
     for o in ops:
-        if o.is_matmul and o.matmul_macs > 0 and o.cores > 0:
+        if o.is_matmul:
             pe = (
                 1.0
                 if o.tiles_output_dim
@@ -1629,7 +1643,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
         )
     split_us = 0.0
     for o in ops:
-        if getattr(o, "is_matmul", False) and o.cores > 0:
+        if getattr(o, "is_matmul", False):
             m_dev = o.matmul_rows_per_core * o.matmul_m_split
             n_dev = o.matmul_cols_per_core * o.matmul_n_split
             lf, sf = (

@@ -248,24 +248,12 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
             for key in output_keys
         }
         sym_reduction_splits = {
-            key: sympy.Symbol(f"reduction_split_{self.name}_{key}")
+            key: sympy.Symbol(
+                f"reduction_split_{self.name}_{key}", integer=True, positive=True
+            )
             for key in reduction_keys
         }
         return (sym_output_splits, sym_reduction_splits)
-        # if not reduction_keys:
-        #     rest = (
-        #         math.prod(sym_output_splits.values())
-        #         / sym_output_splits[output_keys[-1]]
-        #     )
-        #     sym_output_splits[output_keys[-1]] = 32 / (rest * self.sym_inv_cores)
-        # else:
-        #     rest = (
-        #         math.prod(sym_output_splits.values())
-        #         * math.prod(sym_reduction_splits.values())
-        #         / sym_reduction_splits[reduction_keys[-1]]
-        #     )
-        #     sym_reduction_splits[reduction_keys[-1]] = 32 / (rest * self.sym_inv_cores)
-        # return (sym_output_splits, sym_reduction_splits)
 
 
 def assert_in_place_parent_is_read(

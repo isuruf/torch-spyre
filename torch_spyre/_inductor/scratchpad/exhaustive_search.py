@@ -79,6 +79,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
     def plan_layout_and_core_divisions(
         self, cost_expr=None
     ) -> list[CoreDivisionBuffer]:
+        # TODO: use cost_expr here
         buffers_list = cast("list[CoreDivisionBuffer]", self.buffers)
 
         buf_by_name: dict[str, CoreDivisionBuffer] = {b.name: b for b in buffers_list}

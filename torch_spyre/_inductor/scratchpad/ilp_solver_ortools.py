@@ -80,7 +80,6 @@ import math
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-import itertools
 from typing import TYPE_CHECKING, Generic, Optional, TypeVar, cast
 import sympy
 import torch
@@ -104,6 +103,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     _assert_in_place_relationships,
 )
+from torch_spyre._inductor import config
 
 __all__ = ["CpSatLayoutSolver"]
 
@@ -249,9 +249,6 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         when the division is fixed)."""
 
 
-_MAX_CORES = 32
-
-
 @dataclass
 class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer]):
     """The joint-model wrapper: a :class:`CoreDivisionBuffer` plus the vars for
@@ -274,9 +271,8 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         # reduction-axis split, so a reduction-parallel division counts its full
         # parallelism (``output_partition`` alone would score it as 1 core).
         cores_used = [cd.cores_used for cd in b.core_divisions]
-        # Inverse-core proxy for the cost-model objective,
-        # which needs 1/cores as a linear CP-SAT term: cost_expr's sym_inv_cores.
-        inv_cores_used = [_MAX_CORES // cd.cores_used for cd in b.core_divisions]
+        # Inverse-core proxy for the cost-model objective, which needs 1/cores
+        inv_cores_used = [config.sencores // cu for cu in cores_used]
         self.division = m.new_int_var(0, len(b.core_divisions) - 1, f"div_{b.name}")
         self.eff_size = m.new_int_var(0, max(per_core), f"eff_size_{b.name}")
         # total cores this op uses under the chosen div
@@ -288,12 +284,10 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         for i, split_type in enumerate(["output_splits", "reduction_splits"]):
             splits = sym_core_divs[i]
             for key, symbol in splits.items():
-                values = [
-                    int(math.log2(getattr(cd, split_type).get(key, 1)))
-                    for cd in b.core_divisions
-                ]
+                raw = [getattr(cd, split_type).get(key, 1) for cd in b.core_divisions]
+                values = [round(math.log2(v)) for v in raw]
                 cp_var = m.new_int_var(
-                    0, int(math.log2(_MAX_CORES)), f"log_{symbol.name}"
+                    0, int(math.log2(config.sencores)), f"log_{symbol.name}"
                 )
                 m.add_element(self.division, values, cp_var)
                 cp_log_core_divs[i][key] = cp_var
@@ -364,43 +358,28 @@ class _SympyExprToCpSat:
     def convert(self, cost_expr: sympy.Expr, sym_map: dict) -> object:
         """Return the CP-SAT expression equivalent to ``cost_expr`` under
         ``sym_map`` (``sympy symbol -> CP-SAT var``)."""
-        print("Cost Expr", cost_expr)
-        # cost_expr = cost_expr.replace(
-        #     lambda e: e.func in [sympy.Min, sympy.Max],
-        #     lambda e: self._unnest_min(e),
-        # )
-        # print("simplify 1", cost_expr)
+        logger.debug("[CP-SAT layout solver] cost expr (raw): %s", cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.log,
             lambda e: self._log_min(e),
         )
-        print("simplify 2", cost_expr)
+        logger.debug("[CP-SAT layout solver] cost expr (log_min): %s", cost_expr)
         cost_expr = sympy.expand(cost_expr)
-        print("simplify 3", cost_expr)
+        logger.debug("[CP-SAT layout solver] cost expr (expanded): %s", cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.log,
             lambda e: self._log_split(e),
         )
-        print("simplify 4", cost_expr)
+        logger.debug("[CP-SAT layout solver] cost expr (log_split): %s", cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func in [sympy.Min, sympy.Max],
             lambda e: self._truncate_floats_min(e),
         )
-        print("simplify 5", cost_expr)
+        logger.debug("[CP-SAT layout solver] cost expr (truncated): %s", cost_expr)
         custom = {"max": self._my_max, "min": self._my_min}
         return sympy.lambdify(
             list(sym_map.keys()), cost_expr, modules=[custom, "math"]
         )(*sym_map.values())
-
-    @staticmethod
-    def _is_mul_constant(expr, func):
-        # check if an expression is of the form c*func() where c is positive
-        return (
-            isinstance(expr, sympy.Mul)
-            and len(expr.args) == 2
-            and expr.args[-1].func == func
-            and expr.args[0] > 0
-        )
 
     @classmethod
     def _log_min(cls, expr):
@@ -420,29 +399,6 @@ class _SympyExprToCpSat:
             ) * sympy.log(2.0)
         else:
             return expr
-
-    @classmethod
-    def _unnest_min(cls, expr):
-        # rewrites Min(4, 5*Min(x, y)) as Min(4, 5*x, 5*y)
-        result = []
-        func = expr.func
-        values = []
-        for arg in expr.args:
-            if arg.func == func:
-                result.extend(arg.args)
-            elif cls._is_mul_constant(arg, func):
-                result.extend([a * arg.args[0] for a in arg.args[-1].args])
-            elif isinstance(arg, sympy.Add):
-                for i, a in enumerate(arg.args):
-                    if cls._is_mul_constant(a, func):
-                        values.extend([b * a.args[0] for b in a.args[-1].args])
-                    else:
-                        result.append(a)
-            else:
-                result.append(arg)
-        if values:
-            result.extend([sympy.Add(*m) for m in itertools.product(values)])
-        return func(*result)
 
     @staticmethod
     def _truncate_floats_min(expr):
@@ -664,6 +620,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         solver.parameters.random_seed = 0
 
         status = cp_model.INFEASIBLE
+        core_terms = None
 
         if cost_expr is not None:
             sym_map = {}
@@ -673,18 +630,24 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 sym_core_divs = t.buffer.sym_core_divs
                 for splits, cp_splits in zip(sym_core_divs, t.cp_log_core_divs):
                     for key, symbol in splits.items():
-                        sym_map[sympy.Symbol(f"log_{symbol.name}")] = cp_splits[key]
+                        sym_map[
+                            sympy.Symbol(
+                                f"log_{symbol.name}", integer=True, nonnegative=True
+                            )
+                        ] = cp_splits[key]
 
-            cp_cost = _SympyExprToCpSat(model).convert(cost_expr, sym_map)
+            try:
+                cp_cost = _SympyExprToCpSat(model).convert(cost_expr, sym_map)
 
-            logger.debug("[CP-SAT layout solver] cost model expr: %s", cp_cost)
-            model.minimize(cp_cost)
-            status = solver.Solve(model)
-            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                raise SolveError("CP-SAT memory planner found no feasible plan")
-        else:
-            # TODO: Update objective to a maxmin optimization to optimize overall
-            # throughput.
+                logger.debug("[CP-SAT layout solver] cost model expr: %s", cp_cost)
+                model.minimize(cp_cost)
+                status = solver.Solve(model)
+                if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                    raise SolveError("CP-SAT memory planner found no feasible plan")
+            except RuntimeError:
+                cost_expr = None
+
+        if cost_expr is None:
             hbm_terms = [
                 sb.spill_cost() * (1 - sb.in_buffer) for sb in tensors.values()
             ]
