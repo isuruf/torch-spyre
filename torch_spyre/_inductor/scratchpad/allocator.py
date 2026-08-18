@@ -1586,12 +1586,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         from torch_spyre._inductor.dump_cost_model import extract_op_features
 
         op = graph.get_buffer(output_name)
-        orig_op_it_space_splits = op.op_it_space_splits
+        orig_op_it_space_splits = getattr(op, "op_it_space_splits", None)
         try:
             op.op_it_space_splits = buffers[output_name].sym_core_divs
             return extract_op_features(op, buffers)
         finally:
-            op.op_it_space_splits = orig_op_it_space_splits
+            if orig_op_it_space_splits:
+                op.op_it_space_splits = orig_op_it_space_splits
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         # The divisions must be committed such that any buffer clones can correctly
