@@ -33,6 +33,11 @@ from .constants import BATCH_MATMUL_OP
 from .cost_model import ArgTraffic, OpFeatures, explain, max
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+
 
 def cost_dump_enabled() -> bool:
     return os.environ.get("SPYRE_DUMP_COST", "").strip().lower() in {
@@ -457,8 +462,14 @@ def _hbm_pattern(op, is_reduction: bool, out_dims) -> str:
         return ""
 
 
-def extract_op_features(op) -> OpFeatures:
-    """Build OpFeatures for one ComputedBuffer op (best-effort)."""
+def extract_op_features(
+    op, buffers: Optional["LifetimeBoundBuffer"] = None
+) -> OpFeatures:
+    """Build OpFeatures for one ComputedBuffer op (best-effort).
+    buffers is an optional list used for creatng a symbolic cost model.
+    """
+    output_name = op.get_operation_name()
+    buf = buffers.get(output_name) if buffers else None
     data = getattr(op, "data", None)
     is_reduction = getattr(data, "reduction_type", None) is not None
     loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
@@ -477,7 +488,7 @@ def extract_op_features(op) -> OpFeatures:
     out_dims = _device_dims(op.get_layout()) or out_size
     out_elems = _prod_ints(out_dims)
 
-    cores = _cores(op)
+    cores = 32 / buf.sym_inv_cores if buf else _cores(op)
 
     # Cross-core ring combine: work division splits OUTPUT dims first, then the reduced
     # axis with leftover cores -> the reduced axis is split only when out_elems < cores.
@@ -486,7 +497,7 @@ def extract_op_features(op) -> OpFeatures:
     if is_reduction and out_elems < cores:
         reduction_cores = max(1, cores // max(1, out_elems))
 
-    out_mem = _mem_of_layout(op.get_layout())
+    is_lx = buf.sym_is_lx if buf else _mem_of_layout(op.get_layout()) == "lx"
 
     # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull
     # MACs (M*N*K), the per-core M tile (pt_eff), and the K-split k (-> reduction_cores,
@@ -518,7 +529,7 @@ def extract_op_features(op) -> OpFeatures:
     # (rows/tile < col-sticks), leaving each core a full row tile (no underfill). 0.0 =
     # N/A -> no derate.
     tile_rows_per_core = 0.0
-    if tiles_out_dim and loop_trip > 1 and cores > 0 and len(out_dims) >= 2:
+    if tiles_out_dim and loop_trip > 1 and len(out_dims) >= 2:
         # Row extent from the LOGICAL shape, not the device shape. ``out_dims[-2]`` is
         # the row count only for a rank-2 tensor, whose device layout is rank-3. A
         # rank-3 or rank-4 tensor has a rank-4/5 device layout in which [-2] is a
@@ -532,8 +543,8 @@ def extract_op_features(op) -> OpFeatures:
         # previously modelled; it only repairs rank>=3. Same class of mistake, and the
         # same fix, as _matmul_features' batch-dim exclusion above.
         rows = (out_size[-2] if len(out_size) >= 2 else 0) or out_dims[-2]
-        if out_mem != "lx":  # full-buffer alloc: per-tile slice is rows / loop_trip
-            rows = rows / loop_trip
+        # full-buffer alloc: per-tile slice is rows / loop_trip
+        rows = rows / loop_trip * (1 - is_lx) + rows * is_lx
         # `loop_trip > 1` is guaranteed by the branch condition; `_row_split` can in
         # principle return 0 if a split map ever records one, and this term is a
         # diagnostic -- a ZeroDivisionError here would take down a compile for a number
@@ -574,7 +585,7 @@ def extract_op_features(op) -> OpFeatures:
         ArgTraffic(
             name=op.get_operation_name(),
             role="output",
-            is_lx=(out_mem == "lx"),
+            is_lx=is_lx,
             elems=out_elems,
             dims=list(out_dims),
             logical=list(out_size),
@@ -611,14 +622,21 @@ def extract_op_features(op) -> OpFeatures:
             # output size. Only a NON-broadcast unresolved read is conservatively
             # sized at the full output.
             if broadcast:
-                mem, dims, in_elems, in_logical = "hbm", [1], 1, [1]
+                dims, in_elems, in_logical = [1], 1, [1]
             else:
-                mem, dims, in_elems, in_logical = "hbm", list(out_dims), out_elems, []
+                dims, in_elems, in_logical = list(out_dims), out_elems, []
+            inp_is_lx = False
+        else:
+            if buffers:
+                inp_buf = buffers.get(name)
+                inp_is_lx = inp_buf.sym_is_lx if inp_buf is not None else False
+            else:
+                inp_is_lx = mem == "lx"
         args.append(
             ArgTraffic(
                 name=name,
                 role="input",
-                is_lx=(mem == "lx"),
+                is_lx=inp_is_lx,
                 elems=in_elems,
                 broadcast=broadcast,
                 dims=list(dims),
