@@ -982,7 +982,7 @@ def min(*args, **kwargs):
 def log2(arg):
     """``log2`` counterpart of :func:`max`; see its docstring."""
     if isinstance(arg, sympy.Basic):
-        return sympy.log(arg, base=2.0)
+        return sympy.log(arg, 2.0)
     return math.log2(arg)
 
 
