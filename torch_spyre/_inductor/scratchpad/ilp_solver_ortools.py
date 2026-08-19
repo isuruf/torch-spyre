@@ -622,6 +622,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         status = cp_model.INFEASIBLE
         core_terms = None
 
+        if not isinstance(cost_expr, sympy.Basic) or not cost_expr.free_symbols:
+            cost_expr = None
+
         if cost_expr is not None:
             sym_map = {}
             for t in tensors.values():

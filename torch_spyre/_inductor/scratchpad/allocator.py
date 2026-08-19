@@ -1571,7 +1571,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             mm_split_reread_us_per_elem=0.0,
             mm_split_short_us_per_elem=0.0,
         )
-        cost_expr = predict_ops(op_features, params=params)
+        cost_expr = sympy.sympify(predict_ops(op_features, params=params))
         result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
             "CoOptimizingAllocator does not support LX relayout"
