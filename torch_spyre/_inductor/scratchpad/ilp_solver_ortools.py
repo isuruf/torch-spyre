@@ -409,7 +409,7 @@ class _SympyExprToCpSat:
 
         def _process(expr):
             if isinstance(expr, sympy.Mul) and isinstance(expr.args[0], sympy.Number):
-                a = (expr.args[0] * m).n().round()
+                a = (expr.args[0] * m).round()
                 r = sympy.Mul(a, *expr.args[1:])
             elif isinstance(expr, sympy.Number):
                 r = (expr * m).round()
