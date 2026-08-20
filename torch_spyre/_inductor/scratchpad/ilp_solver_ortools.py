@@ -355,7 +355,7 @@ class _SympyExprToCpSat:
         self._model = model
         self._count = 0
 
-    def convert(self, cost_expr: sympy.Expr, sym_map: dict) -> object:
+    def convert(self, cost_expr: sympy.Expr, sym_map: dict) -> "cp_model.LinearExpr":
         """Return the CP-SAT expression equivalent to ``cost_expr`` under
         ``sym_map`` (``sympy symbol -> CP-SAT var``)."""
         logger.debug("[CP-SAT layout solver] cost expr (raw): %s", cost_expr)
