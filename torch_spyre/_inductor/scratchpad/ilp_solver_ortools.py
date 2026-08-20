@@ -622,9 +622,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         status = cp_model.INFEASIBLE
         core_terms = None
 
-        if not isinstance(cost_expr, sympy.Basic) or not cost_expr.free_symbols:
-            cost_expr = None
-
         if cost_expr is not None:
             sym_map = {}
             for t in tensors.values():
@@ -643,7 +640,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 cp_cost = _SympyExprToCpSat(model).convert(cost_expr, sym_map)
 
                 logger.debug("[CP-SAT layout solver] cost model expr: %s", cp_cost)
-                model.minimize(cp_cost)
+                if not isinstance(cp_cost, (int, float)):
+                    # if the cost is non-constant, we minimize it
+                    # if the cost is constant, we use any solution
+                    model.minimize(cp_cost)
                 status = solver.Solve(model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     raise SolveError("CP-SAT memory planner found no feasible plan")
