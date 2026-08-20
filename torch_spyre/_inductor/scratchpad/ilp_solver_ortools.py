@@ -647,7 +647,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 status = solver.Solve(model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     raise SolveError("CP-SAT memory planner found no feasible plan")
-            except RuntimeError:
+            except (RuntimeError, TypeError):
                 cost_expr = None
 
         if cost_expr is None:
