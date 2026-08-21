@@ -471,8 +471,7 @@ def extract_op_features(
     buffers is an optional name -> LifetimeBoundBuffer map used for creating a
     symbolic cost model.
     """
-    output_name = op.get_operation_name()
-    buf = buffers.get(output_name) if buffers else None
+    buf = buffers.get(op.name) if buffers else None
     data = getattr(op, "data", None)
     is_reduction = getattr(data, "reduction_type", None) is not None
     loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
