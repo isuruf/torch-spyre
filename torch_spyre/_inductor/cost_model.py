@@ -141,13 +141,12 @@ Parameters live in :class:`CostParams`, calibrated from device measurements
 (``examples/run_cost_model_plan.sh``).
 """
 
-import builtins
 import dataclasses
 import math
 
 import sympy
 
-from .work_division import _matmul_split_cost
+from .work_division import _matmul_split_cost, min, max, log2
 
 
 @dataclasses.dataclass
@@ -973,34 +972,6 @@ def mm_spill_frac(tile_area: float, params: CostParams | None = None) -> float:
     )
 
 
-def max(*args, **kwargs):
-    """``max``, but symbolic-aware: dispatches to ``sympy.Max`` when an arg is
-    a sympy expression (whose truth-valued comparisons the builtin can't
-    resolve), otherwise defers to the builtin -- including its ``key``/
-    ``default`` kwargs and single-iterable form, neither of which ``sympy.Max``
-    supports."""
-    if any(isinstance(a, sympy.Basic) for a in args):
-        return sympy.Max(*args)
-    return builtins.max(*args, **kwargs)
-
-
-def min(*args, **kwargs):
-    """``min`` counterpart of :func:`max`; see its docstring."""
-    if any(isinstance(a, sympy.Basic) for a in args):
-        return sympy.Min(*args)
-    return builtins.min(*args, **kwargs)
-
-
-def log2(arg):
-    """``log2`` counterpart of :func:`max`; see its docstring."""
-    if isinstance(arg, sympy.Basic):
-        if isinstance(arg, sympy.Rational):
-            return sympy.log(arg.n(), 2.0)
-        else:
-            return sympy.log(arg, 2.0)
-    return math.log2(arg)
-
-
 def _fused_hbm_bytes(ops: list) -> tuple:
     """(read, write) HBM bytes for a FUSED bundle, counting each distinct EXTERNAL graph
     input (name starts ``arg``) ONCE even if several fused ops read it -- a fused kernel
@@ -1378,8 +1349,7 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
 
 
 def _matmul_ns_bundled(ops: list, p: CostParams) -> float:
-    """Bundled matmul predicted device latency (ns)""
-    """
+    """Bundled matmul predicted device latency (ns)"" """
     r, w = _fused_hbm_bytes(ops)
     # Operand re-read: when the per-core output tile of area (M/m)*(N/n) overflows the
     # on-chip capacity, both operands (|A|+|B|) are re-streamed by the same fraction.
