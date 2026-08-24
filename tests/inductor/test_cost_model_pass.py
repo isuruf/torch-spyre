@@ -448,6 +448,12 @@ def _looped(name, trip, args, matmul=False):
         loop_trip=trip,
         is_matmul=matmul,
         tiles_output_dim=matmul,
+        # A concrete matmul geometry so a bundle containing this op is priceable by
+        # ``_matmul_axes_for_split_cost`` (M=rows_per_core, N=cols_per_core, K backed
+        # out of matmul_a_bytes) -- unused when ``matmul`` is False.
+        matmul_rows_per_core=64.0,
+        matmul_cols_per_core=64.0,
+        matmul_a_bytes=64 * 64 * 2,
     )
     f.get_device = lambda: _Device(DEVICE_NAME)
     return f

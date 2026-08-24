@@ -1566,10 +1566,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # whereas the default gives max(compute, mem_t)
             # which optimizes compute only when there's a matmul
             overlap_gamma=0.46,
-            # TODO: remove these
-            underfill_pass_rows=0,
-            mm_split_reread_us_per_elem=0.0,
-            mm_split_short_us_per_elem=0.0,
+            use_bundled_cost_model=False,
         )
         cost_expr = sympy.sympify(predict_ops(op_features, params=params))
         result = solver.plan_layout_and_core_divisions(cost_expr)
