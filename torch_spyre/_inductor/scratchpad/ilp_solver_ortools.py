@@ -82,6 +82,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Generic, Optional, TypeVar, cast
 import sympy
+from sympy.printing.printer import Printer
 import torch
 
 
@@ -280,18 +281,32 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         self.inv_cores = m.new_int_var(0, max(inv_cores_used), f"inv_cores_{b.name}")
 
         sym_core_divs = b.sym_core_divs
+        cp_core_divs = ({}, {})
+        cp_inv_core_divs = ({}, {})
         cp_log_core_divs = ({}, {})
         for i, split_type in enumerate(["output_splits", "reduction_splits"]):
             splits = sym_core_divs[i]
             for key, symbol in splits.items():
+                assert isinstance(symbol, sympy.Symbol)
                 raw = [getattr(cd, split_type).get(key, 1) for cd in b.core_divisions]
-                values = [round(math.log2(v)) for v in raw]
-                cp_var = m.new_int_var(
+                cp_var = m.new_int_var(1, config.sencores, f"{symbol.name}")
+                m.add_element(self.division, raw, cp_var)
+                cp_core_divs[i][key] = cp_var
+
+                inv_values = [config.sencores // v for v in raw]
+                cp_inv_var = m.new_int_var(1, config.sencores, f"inv_{symbol.name}")
+                m.add_element(self.division, inv_values, cp_inv_var)
+                cp_inv_core_divs[i][key] = cp_inv_var
+
+                log_values = [round(math.log2(v)) for v in raw]
+                cp_log_var = m.new_int_var(
                     0, int(math.log2(config.sencores)), f"log_{symbol.name}"
                 )
-                m.add_element(self.division, values, cp_var)
-                cp_log_core_divs[i][key] = cp_var
+                m.add_element(self.division, log_values, cp_log_var)
+                cp_log_core_divs[i][key] = cp_log_var
 
+        self.cp_core_divs = cp_core_divs
+        self.cp_inv_core_divs = cp_inv_core_divs
         self.cp_log_core_divs = cp_log_core_divs
 
         # tie per-core footprint (output split only) and total core usage to the
@@ -346,25 +361,34 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         self.buffer.chosen_division = solver.Value(self.division)
 
 
-class _SympyExprToCpSat:
+class _SympyExprToCpSat(Printer):
     """Translates a sympy cost expression into an OR-Tools CP-SAT expression
     over an existing ``sympy symbol -> CP-SAT var`` mapping.
     """
 
-    def __init__(self, model: "cp_model.CpModel") -> None:
+    def __init__(self, model: "cp_model.CpModel", sym_map: dict) -> None:
         self._model = model
         self._count = 0
+        self._sym_map = sym_map
+        super().__init__()
 
-    def convert(self, cost_expr: sympy.Expr, sym_map: dict) -> "cp_model.LinearExpr":
+    def convert(self, cost_expr: sympy.Expr) -> "cp_model.LinearExpr":
         """Return the CP-SAT expression equivalent to ``cost_expr`` under
         ``sym_map`` (``sympy symbol -> CP-SAT var``)."""
         logger.debug("[CP-SAT layout solver] cost expr (raw): %s", cost_expr)
+        cost_expr = cost_expr.replace(
+            lambda e: e.func == sympy.floor,
+            lambda e: e.args[0],
+        )
+        logger.debug("[CP-SAT layout solver] cost expr (remove floor): %s", cost_expr)
+        cost_expr = sympy.expand(cost_expr).n()
+        logger.debug("[CP-SAT layout solver] cost expr (expanded): %s", cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.log,
             lambda e: self._log_min(e),
         )
         logger.debug("[CP-SAT layout solver] cost expr (log_min): %s", cost_expr)
-        cost_expr = sympy.expand(cost_expr)
+        cost_expr = sympy.expand(cost_expr).n()
         logger.debug("[CP-SAT layout solver] cost expr (expanded): %s", cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.log,
@@ -372,21 +396,33 @@ class _SympyExprToCpSat:
         )
         logger.debug("[CP-SAT layout solver] cost expr (log_split): %s", cost_expr)
         cost_expr = cost_expr.replace(
+            lambda e: e.func == sympy.Pow,
+            lambda e: self._inv_sym(e),
+        )
+        logger.debug("[CP-SAT layout solver] cost expr (inv_sym): %s", cost_expr)
+        cost_expr = cost_expr.replace(
             lambda e: e.func in [sympy.Min, sympy.Max],
             lambda e: self._truncate_floats_min(e),
         )
         logger.debug("[CP-SAT layout solver] cost expr (truncated): %s", cost_expr)
-        custom = {"max": self._my_max, "min": self._my_min}
-        return sympy.lambdify(
-            list(sym_map.keys()), cost_expr, modules=[custom, "math"]
-        )(*sym_map.values())
+        return self._print(cost_expr)
 
     @classmethod
     def _log_min(cls, expr):
         # rewrite log(min(a, b)) as min(log(a), log(b))
         arg = expr.args[0]
         if isinstance(arg, (sympy.Min, sympy.Max)):
-            return arg.func(*[sympy.log(a) for a in arg.args])
+            # n() here is to get a numeric value instead of log(2)
+            return arg.func(*[sympy.log(a.n()) for a in arg.args])
+        if (
+            isinstance(arg, sympy.Mul)
+            and len(arg.args) == 2
+            and isinstance(arg.args[0], sympy.Number)
+            and isinstance(arg.args[1], (sympy.Min, sympy.Max))
+        ):
+            return arg.func(
+                *[sympy.log((a * arg.args[0]).n()) for a in arg.args[1].args]
+            )
         else:
             return expr
 
@@ -397,6 +433,25 @@ class _SympyExprToCpSat:
             return sympy.Symbol(
                 f"log_{arg.name}", integer=True, nonnegative=True
             ) * sympy.log(2.0)
+        else:
+            return expr
+
+    @classmethod
+    def _inv_sym(cls, expr):
+        if not isinstance(expr.base, sympy.Symbol):
+            return expr
+        if expr.exp != -1:
+            return expr
+        symbol = expr.base
+        if (
+            "_split_" in symbol.name
+            and "log_" not in symbol.name
+            and "inv_" not in symbol.name
+        ):
+            return (
+                sympy.Symbol(f"inv_{symbol.name}", integer=True, nonnegative=True)
+                / config.sencores
+            )
         else:
             return expr
 
@@ -424,6 +479,40 @@ class _SympyExprToCpSat:
                 result.append(_process(arg))
 
         return func(*result) / m
+
+    def _print_Integer(self, expr):
+        return int(expr.p)
+
+    def _print_Number(self, expr):
+        return float(expr)
+
+    def _print_Add(self, expr):
+        return sum(self._print(arg) for arg in expr.args)
+
+    def _print_Mul(self, expr):
+        args = [self._print(arg) for arg in expr.args]
+        ints = [arg for arg in args if isinstance(arg, cp_model.IntVar)]
+        if len(ints) <= 1:
+            return math.prod(args)
+
+        nonints = [arg for arg in args if not isinstance(arg, cp_model.IntVar)]
+        lb, ub = map(math.prod, zip(*[self._affine_bounds(arg) for arg in args]))
+        name = "product_" + "_".join([arg.name for arg in ints])
+        if name in self._sym_map:
+            return self._sym_map[name]
+        product = self._model.NewIntVar(int(lb), int(ub), name)
+        self._model.AddMultiplicationEquality(product, ints)
+        self._sym_map[name] = product
+        return math.prod(nonints) * product
+
+    def _print_Symbol(self, expr):
+        return self._sym_map[expr.name]
+
+    def _print_Pow(self, expr):
+        return self._print(expr.base) ** self._print(expr.pow)
+
+    def _print_log(self, expr):
+        raise NotImplementedError(f"log not implemented. expr: {expr}")
 
     @staticmethod
     def _affine_bounds(expr):
@@ -453,16 +542,18 @@ class _SympyExprToCpSat:
             return lb, ub
         raise TypeError(f"unsupported expr type: {type(expr)}")
 
-    def _my_max(self, *args):
+    def _print_Max(self, expr):
         # max range is (max(mins), max(maxes))
+        args = [self._print(arg) for arg in expr.args]
         bounds = map(max, zip(*[self._affine_bounds(arg) for arg in args]))
         max_var = self._model.NewIntVar(*bounds, f"max_var_{self._count}")
         self._model.AddMaxEquality(max_var, args)
         self._count += 1
         return max_var
 
-    def _my_min(self, *args):
+    def _print_Min(self, expr):
         # min range is (min(mins), min(maxes))
+        args = [self._print(arg) for arg in expr.args]
         bounds = map(min, zip(*[self._affine_bounds(arg) for arg in args]))
         min_var = self._model.NewIntVar(*bounds, f"min_var_{self._count}")
         self._model.AddMinEquality(min_var, args)
@@ -625,19 +716,22 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         if cost_expr is not None:
             sym_map = {}
             for t in tensors.values():
-                sym_map[t.buffer.sym_is_lx] = t.in_buffer
-                sym_map[t.buffer.sym_inv_cores] = t.inv_cores
+                sym_map[t.buffer.sym_is_lx.name] = t.in_buffer
                 sym_core_divs = t.buffer.sym_core_divs
-                for splits, cp_splits in zip(sym_core_divs, t.cp_log_core_divs):
+                for splits, cp_splits, cp_inv_splits, cp_log_splits in zip(
+                    sym_core_divs,
+                    t.cp_core_divs,
+                    t.cp_inv_core_divs,
+                    t.cp_log_core_divs,
+                ):
                     for key, symbol in splits.items():
-                        sym_map[
-                            sympy.Symbol(
-                                f"log_{symbol.name}", integer=True, nonnegative=True
-                            )
-                        ] = cp_splits[key]
+                        assert isinstance(symbol, sympy.Symbol)
+                        sym_map[symbol.name] = cp_splits[key]
+                        sym_map[f"inv_{symbol.name}"] = cp_inv_splits[key]
+                        sym_map[f"log_{symbol.name}"] = cp_log_splits[key]
 
             try:
-                cp_cost = _SympyExprToCpSat(model).convert(cost_expr, sym_map)
+                cp_cost = _SympyExprToCpSat(model, sym_map).convert(cost_expr)
 
                 logger.debug("[CP-SAT layout solver] cost model expr: %s", cp_cost)
                 if not isinstance(cp_cost, (int, float)):

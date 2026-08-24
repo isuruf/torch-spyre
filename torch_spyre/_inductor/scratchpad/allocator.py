@@ -1583,7 +1583,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         Same extraction as dump_cost_model.extract_op_features, but keyed off
         each buffer's *symbolic* is_lx/cores/core-division vars (sym_is_lx,
-        sym_inv_cores, sym_core_divs) instead of concrete values, so the
+        sym_core_divs) instead of concrete values, so the
         resulting OpFeatures can be fed to predict_ops() to build a cost
         expression over the solver's own decision variables.
         """

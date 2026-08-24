@@ -29,7 +29,6 @@ import os
 
 from torch._inductor.ir import ComputedBuffer
 
-from torch_spyre._inductor import config
 
 from .constants import BATCH_MATMUL_OP
 from .cost_model import ArgTraffic, OpFeatures, explain, max
@@ -490,13 +489,13 @@ def extract_op_features(
     out_dims = _device_dims(op.get_layout()) or out_size
     out_elems = _prod_ints(out_dims)
 
-    cores = config.sencores / buf.sym_inv_cores if buf else _cores(op)
+    cores = buf.sym_cores if buf else _cores(op)
 
     # Cross-core ring combine: work division splits OUTPUT dims first, then the reduced
     # axis with leftover cores -> the reduced axis is split only when out_elems < cores.
     # Approx k as the cores not absorbed by the output (refine if rung 11 needs it).
     reduction_cores = 1
-    if is_reduction and out_elems < cores:
+    if is_reduction:
         reduction_cores = max(1, cores // max(1, out_elems))
 
     is_lx = buf.sym_is_lx if buf else _mem_of_layout(op.get_layout()) == "lx"

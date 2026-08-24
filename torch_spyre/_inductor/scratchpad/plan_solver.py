@@ -21,6 +21,7 @@ import itertools
 import math
 import sympy
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+
 from enum import Enum
 
 if TYPE_CHECKING:
@@ -220,8 +221,9 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         return sympy.Symbol(f"is_lx_{self.name}", integer=True, nonnegative=True)
 
     @property
-    def sym_inv_cores(self) -> sympy.Symbol:
-        return sympy.Symbol(f"inv_cores_{self.name}", integer=True, positive=True)
+    def sym_cores(self) -> sympy.Symbol:
+        output, reduction = self.sym_core_divs
+        return math.prod(output.values()) * math.prod(reduction.values())
 
     @property
     def sym_core_divs(self) -> tuple[dict, dict]:
@@ -241,18 +243,14 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         reduction_keys = unique(
             itertools.chain.from_iterable(cd.reduction_splits for cd in core_divs)
         )
-        sym_output_splits = {
-            key: sympy.Symbol(
-                f"output_split_{self.name}_{key}", integer=True, positive=True
+
+        def sym(prefix, key):
+            return sympy.Symbol(
+                f"{prefix}_split_{self.name}_{key}", integer=True, positive=True
             )
-            for key in output_keys
-        }
-        sym_reduction_splits = {
-            key: sympy.Symbol(
-                f"reduction_split_{self.name}_{key}", integer=True, positive=True
-            )
-            for key in reduction_keys
-        }
+
+        sym_output_splits = {key: sym("output", key) for key in output_keys}
+        sym_reduction_splits = {key: sym("reduction", key) for key in reduction_keys}
         return (sym_output_splits, sym_reduction_splits)
 
 
