@@ -1350,38 +1350,6 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
 
 def _matmul_ns_bundled(ops: list, p: CostParams) -> float:
     """Bundled matmul predicted device latency (ns)"" """
-    r, w = _fused_hbm_bytes(ops)
-    # Operand re-read: when the per-core output tile of area (M/m)*(N/n) overflows the
-    # on-chip capacity, both operands (|A|+|B|) are re-streamed by the same fraction.
-    # Read-rate bytes. (Fanout was proven NOT a term by the re-read sweep.)
-    spill = sum(
-        (o.matmul_a_bytes + o.matmul_b_bytes)
-        * mm_spill_frac(o.matmul_rows_per_core * o.matmul_cols_per_core, p)
-        for o in ops
-        if getattr(o, "is_matmul", False)
-    )
-    # The loop-invariant re-read is held OUT of this term and charged separately below,
-    # at peak and outside the per-tile underfill derate.
-    r_base = r - _loop_reread_bytes(ops)
-    mem = (
-        r_base / p.mm_bw_read_gbps
-        + w / p.mm_bw_write_gbps
-        + spill / p.mm_bw_read_gbps
-        + p.rw_turnaround_ns_per_byte * min(r_base, w)
-    )
-    # A matmul bundle keeps the pre-re-fit rows-only coarse-tiling curve: the new
-    # surface is fitted entirely on softmax and scores WORSE on tiled matmul (see the
-    # CostParams note).
-    eff = 1.0
-    for o in ops:
-        if o.loop_trip > 1 and o.tiles_output_dim and o.tile_rows_per_core > 0:
-            eff = min(eff, coarse_underfill_eff_matmul(o.tile_rows_per_core, p))
-    spill_derate = _lx_spill_bw_derate(ops, p)
-    mem_t = p.fill_ns + mem / eff / spill_derate
-    # LOOP-INVARIANT OPERAND RE-READ, charged AFTER the derates and at the plain peak
-    # rate -- a re-read of a loop-invariant operand is one large CONTIGUOUS pass over
-    # the whole operand, not tile-shaped, and must not be inflated by 1/eff.
-    mem_t += p.loop_reread_scale * _loop_reread_bytes(ops) / p.mm_bw_read_gbps
     # MATMUL compute = MACs/cores derated by pt_eff (PT-array fill).
     compute = 0.0
     for o in ops:
@@ -1427,11 +1395,7 @@ def _matmul_ns_bundled(ops: list, p: CostParams) -> float:
                 * max(0.0, log2(short_fan) - log2(p.mm_split_short_knee))
             )
             split_ns += split_us * 1000.0  # us -> ns
-    # compute/HBM OVERLAP: the engine streams operands while the systolic array works,
-    # so a kernel takes the LONGER of the two rather than their sum. The split re-read
-    # is charged AFTER the overlap: it is not hidden by compute -- it is why the
-    # lopsided kernel runs long.
-    return compute + mem_t - p.overlap_gamma * min(compute, mem_t) + split_ns
+    return compute + split_ns
 
 
 def predict_ops(ops: list, params: CostParams | None = None) -> float:
@@ -1453,10 +1417,6 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     (``coarse_underfill_eff``, keyed on per-core rows per tile AND the row width).
     """
     p = params or CostParams()
-    if any(getattr(o, "is_matmul", False) for o in ops):
-        if p.use_bundled_cost_model:
-            return _matmul_ns_bundled(ops, p)
-        return _matmul_ns_upstream(ops, p)
     r, w = _fused_hbm_bytes(ops)
     # HBM. Pointwise/reduction/transport keep the single-BW turnaround model.
     _pat_bw = {
@@ -1575,7 +1535,40 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # BW.
     spill_derate = _lx_spill_bw_derate(ops, p)
     # A fused reduction bundle is floored by per-core element throughput (see
-    t = p.fill_ns + mem / eff / spill_derate
+    mem_t = p.fill_ns + mem / eff / spill_derate
+    # LOOP-INVARIANT OPERAND RE-READ, charged AFTER the derates and at the plain peak
+    # rate. Placement is the mechanism, not a convenience: `eff` models a SHORT PER-TILE
+    # stream underfilling the pipeline, but a re-read of a loop-invariant operand is one
+    # large CONTIGUOUS pass over the whole operand -- it is not tile-shaped and must not
+    # be inflated by 1/eff (the same reason `_fused_floor_ns` is applied here and not
+    # inside `mem`). Measured: at cores=32 each extra iteration costs 0.90-1.24x a full
+    # HBM pass over B at 150 GB/s (B = 2/4/8/16 MB -> 1.24/0.99/0.97/0.90), while the
+    # marginal cost itself spans 5.8x -- so it scales with the operand, and is not a
+    # fixed per-iteration overhead. 0 until the extractor sets per-arg `loop_factor`.
+    mem_t += p.loop_reread_scale * _loop_reread_bytes(ops) / p.mm_bw_read_gbps
+
+    if p.use_bundled_cost_model:
+        compute = _matmul_ns_bundled(ops, p)
+    else:
+        compute = _matmul_ns_upstream(ops, p)
+    # compute/HBM OVERLAP: the engine streams operands while the systolic array works,
+    # so a kernel takes the LONGER of the two rather than their sum. For a non-matmul
+    # bundle compute=0 -> t = mem_t (unchanged). The split re-read is charged AFTER the
+    # overlap: it is not hidden by compute -- it is why the lopsided kernel runs long.
+    #
+    # A PARTIAL-overlap form was fitted and deliberately dropped; see the module
+    # docstring. What remains below is the GATE, stated honestly. `loop_trip > 1`
+    # currently decides ZERO rows (it is implied by tiles_output_dim on every record we
+    # hold), so its "a loop can pipeline across iterations" rationale is UNTESTED -- it
+    # is kept only as a guard for future non-looped output-tiled ops.
+    # `tiles_output_dim` binds on just 8 rows (bmm_3d2d_k_tiling), which already
+    # under-predict ~17 %, so those rows cannot
+    # distinguish "reduction-tiled iterations are dependent" from "that op's memory term
+    # is too small". What IS established is only that SOME gate is needed: removing both
+    # regresses mmwd 15.1 -> 17.6 and bmm_layout 20.2 -> 25.5. Compute and memory
+    # OVERLAP: the engine streams operands while the array works, so a kernel takes the
+    # LONGER of the two rather than their sum.
+    t = compute + mem_t - p.overlap_gamma * min(compute, mem_t)
     # (A genuine-reduction cross-core ring-combine term once lived here; it is provably
     # bounded by ~cores * a tiny per-elem cost <= ~5 ns -- below run-to-run noise --
     # so it is dropped as inert. K is never split for matmul, so there is no matmul
