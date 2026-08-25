@@ -71,9 +71,11 @@ for a split reduced axis was dropped as sub-noise -- provably <=~5ns on us kerne
 MATMUL (reduction_type batchmatmul) is priced by one of two independent
 implementations, switched on ``CostParams.use_bundled_cost_model``:
 
-- UPSTREAM (``use_bundled_cost_model=False``): priced entirely by
+- UPSTREAM (``use_bundled_cost_model=False``): the compute/split-shape part of
   ``work_division._matmul_split_cost`` -- the same heuristic the work-division planner
-  uses to choose a matmul's core split
+  uses to choose a matmul's core split, called with ``include_hbm=False``. Its own
+  HBM-traffic term is dropped because the bundle memory term below already charges the
+  operand/output bytes, and does so LX-aware; charging both double-counts memory.
 
 - BUNDLED (``use_bundled_cost_model=True``): the original device-calibrated model,
   kept alongside the above rather than deleted. Adds a compute term that OVERLAPS the
@@ -1299,8 +1301,13 @@ def _matmul_axes_for_split_cost(o) -> tuple | None:
 
 
 def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
-    """Predicted device latency (ns) for a bundle containing a matmul, using the UPSTREAM
+    """Compute-side (ns) of a bundle containing a matmul, using the UPSTREAM
     (``CostParams.use_bundled_cost_model=False``) matmul model.
+
+    HBM traffic is EXCLUDED (``include_hbm=False``) and left to ``predict_ops``' shared
+    memory term, exactly as for ``_matmul_ns_bundled`` -- the two terms count the same
+    operand/output bytes, so charging both double-counts memory (and the split-cost
+    version is blind to LX residency, which is what the co-optimizing planner steers).
     """
     total_us = 0.0
     for o in ops:
@@ -1315,7 +1322,13 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
             )
         b_axis, m_axis, n_axis, k_axis, shared_weight, cores_used = axes
         us = _matmul_split_cost(
-            b_axis, m_axis, n_axis, k_axis, cores_used, shared_weight=shared_weight
+            b_axis,
+            m_axis,
+            n_axis,
+            k_axis,
+            cores_used,
+            shared_weight=shared_weight,
+            include_hbm=False,
         )
         if us == float("inf"):
             raise RuntimeError(
@@ -1380,11 +1393,13 @@ def _matmul_ns_bundled(ops: list, p: CostParams) -> float:
 def predict_ops(ops: list, params: CostParams | None = None) -> float:
     """Predicted device latency (ns) for a bundle of ops (one fused kernel).
 
-    A bundle containing a matmul is priced by ``_matmul_ns_upstream`` (defers to
+    A matmul in the bundle adds a compute term from ``_matmul_ns_upstream`` (defers to
     ``work_division._matmul_split_cost``) or, when ``CostParams.use_bundled_cost_model``
-    is set, ``_matmul_ns_bundled`` (the original device-calibrated compute/HBM/
-    spill/split-shape model); see the module docstring. Every other bundle uses the
-    device-calibrated bandwidth/turnaround/underfill model below:
+    is set, ``_matmul_ns_bundled`` (the original device-calibrated compute/spill/
+    split-shape model); see the module docstring. Either way the operand/output HBM
+    bytes are charged ONCE, by the memory term below -- neither matmul model carries an
+    HBM term of its own. Every bundle uses the device-calibrated bandwidth/turnaround/
+    underfill model below:
 
     ``T = fill + [(R+W)/BW_PEAK + alpha*min(R,W)] / eff_underfill`` where R/W are the
     bundle's HBM read/write bytes (LX ~free), already
@@ -1501,8 +1516,9 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # OUTPUT-dim (pointwise) coarse-tiling underfill: a short per-core tile underfills
     # the streaming pipeline, derating the bandwidth term. The smallest tile in the
     # bundle governs (worst underfill). 1.0 (no derate) when nothing is output-tiled.
-    # (No matmul bundle ever reaches here -- see the early return above -- so this is
-    # unconditionally the non-matmul, softmax-calibrated surface.)
+    # (This is the non-matmul, softmax-calibrated surface; a matmul bundle reaches it
+    # too, and the matmul-calibrated curve `coarse_underfill_eff_matmul` is currently
+    # used only by the bundled explain path.)
     eff = 1.0
     for o in ops:
         if o.loop_trip > 1 and o.tiles_output_dim and o.tile_rows_per_core > 0:
@@ -1684,13 +1700,13 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     if any(getattr(o, "is_matmul", False) for o in ops) and p.use_bundled_cost_model:
         return _explain_matmul_bundled(lines, ops, p)
     if any(getattr(o, "is_matmul", False) for o in ops):
-        # Matmul is priced entirely by work_division._matmul_split_cost -- see the
-        # module docstring. There is no base/turnaround/underfill breakdown to show;
-        # report the reconstructed axes each matmul op was priced with instead.
+        # Matmul compute comes from work_division._matmul_split_cost (HBM excluded --
+        # see the module docstring), and the bundle memory term supplies the traffic.
+        # Report the reconstructed axes each matmul op was priced with, then R/W.
         lines.append(
             "  -- prediction (matmul, via work_division._matmul_split_cost) --"
         )
-        total_ns = 0.0
+        compute_ns = 0.0
         for o in ops:
             if not getattr(o, "is_matmul", False):
                 continue
@@ -1703,7 +1719,13 @@ def explain(ops: list, params: CostParams | None = None) -> str:
                 )
             (B, b), (M, m), (N, n), (K, k), shared_weight, cores_used = axes
             us = _matmul_split_cost(
-                (B, b), (M, m), (N, n), (K, k), cores_used, shared_weight=shared_weight
+                (B, b),
+                (M, m),
+                (N, n),
+                (K, k),
+                cores_used,
+                shared_weight=shared_weight,
+                include_hbm=False,
             )
             if us == float("inf"):
                 raise RuntimeError(
@@ -1714,10 +1736,14 @@ def explain(ops: list, params: CostParams | None = None) -> str:
             lines.append(
                 f"     {o.name}: B={B}(/{b}) M={M:.0f}(/{m}) N={N:.0f}(/{n}) "
                 f"K={K:.0f}(/{k}) shared_weight={shared_weight} "
-                f"cores={cores_used} -> {us:.2f} us"
+                f"cores={cores_used} -> compute {us:.2f} us"
             )
-            total_ns += us * 1000.0
-        lines.append(f"     => T_model = {total_ns / 1000:.2f} us")
+            compute_ns += us * 1000.0
+        R, W = _fused_hbm_bytes(ops)  # external input counted once (fused kernel)
+        lines.append(
+            f"     compute = {compute_ns / 1000:.2f} us   R={R}B (read) W={W}B (write)"
+        )
+        lines.append(f"     => T_model = {predict_ops(ops, p) / 1000:.2f} us")
         return "\n".join(lines)
     # Prediction with the rough calculation spelled out, so SPYRE_DUMP_COST shows the
     # same step-by-step breakdown (base + turnaround, then the underfill derate for

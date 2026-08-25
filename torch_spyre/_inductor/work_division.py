@@ -1234,10 +1234,16 @@ def _matmul_split_cost(
     k_axis: tuple[int, int],
     max_cores: int,
     shared_weight: bool = False,
+    include_hbm: bool = True,
 ) -> float:
     """Estimated kernel time in microseconds for ``[B,M,K]@[B,K,N]`` run with
     the given core split. Each axis is a ``(size, split)`` pair so a dim's size
     cannot be paired with another dim's split. Lower is better; inf if infeasible.
+
+    ``include_hbm=False`` drops the operand/output HBM-traffic term for a caller
+    that charges that traffic itself (``cost_model._matmul_ns_upstream``, whose
+    bundle memory term counts the same bytes and knows about LX residency). The
+    cohort bandwidth penalty scales only that term, so it drops out with it.
     """
     (B, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k
@@ -1266,16 +1272,19 @@ def _matmul_split_cost(
     # HBM: every input operand is broadcast to the cohort of cores splitting the
     # orthogonal dim. Past _COHORT_LIMIT the broadcasts contend for the shared
     # link, so effective bandwidth falls off linearly with cohort size.
-    weight_batches = 1 if shared_weight else B
-    bytes_total = (B * M * K + weight_batches * K * N + B * M * N) * _DTYPE_BYTES
-    fanout_split = max(m, n) if shared_weight else n
-    # TODO: Remove special casing symbolic
-    cohort_penalty = (
-        1.0
-        if is_symbolic
-        else max(1.0, (fanout_split / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT)
-    )
-    hbm_us = bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
+    if include_hbm:
+        weight_batches = 1 if shared_weight else B
+        bytes_total = (B * M * K + weight_batches * K * N + B * M * N) * _DTYPE_BYTES
+        fanout_split = max(m, n) if shared_weight else n
+        # TODO: Remove special casing symbolic
+        cohort_penalty = (
+            1.0
+            if is_symbolic
+            else max(1.0, (fanout_split / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT)
+        )
+        hbm_us = bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
+    else:
+        hbm_us = 0.0
 
     # PSUM: a K-split spreads the reduction over k cores, costing (k-1)
     # partial-sum hops. Charge each core's output tile rather than the whole
