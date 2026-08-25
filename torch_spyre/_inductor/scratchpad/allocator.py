@@ -1726,10 +1726,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if op is None or buf.chosen_division is None:
                 continue
             cd = buf.core_divisions[buf.chosen_division]
+            orig = getattr(op, "op_it_space_splits", None)
             op.op_it_space_splits = (
                 dict(cd.output_splits),
                 dict(cd.reduction_splits),
             )
+            if orig != op.op_it_space_splits:
+                print("core division optimizing (%s): %s → %s" % (self._get_op_name(op), orig, op.op_it_space_splits))
 
     def _determine_in_place_division_invariant(
         self, graph: GraphLowering
