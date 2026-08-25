@@ -1425,14 +1425,14 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     }
 
     def _eff_bw(o):  # per-op effective-BW override, or None -> default turnaround
+        if any(isinstance(a.is_lx, sympy.Basic) for a in o.args):
+            # TODO: make symbolic
+            return None
         pat = getattr(o, "hbm_pattern", "")
         if pat == "stick_scatter":  # cat0: strided stick-plane gather (tagged)
             return transport_bw(o, p, "cat0")
         if pat in _pat_bw:  # restickify (transpose), reduce_outer (sumcol)
             return _pat_bw[pat]
-        if any(isinstance(a.is_lx, sympy.Basic) for a in o.args):
-            # TODO: make symbolic
-            return None
         if _is_broadcast_op(o):
             return broadcast_bw(o, p)
         kind = _transport_kind(
@@ -1444,7 +1444,6 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
 
     # Only the fused-reduction branch below raises this; every other path leaves it at 0
     # so the `max()` at `mem_t` is a no-op for them.
-
     if any(_eff_bw(o) is not None for o in ops):
         # Per-op effective BW (access-pattern transports OR a broadcast operand); these
         # fold turnaround into the rate. Ops without an override keep the default

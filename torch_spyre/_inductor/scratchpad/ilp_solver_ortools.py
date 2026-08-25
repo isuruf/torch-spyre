@@ -87,10 +87,10 @@ import torch
 
 
 if TYPE_CHECKING:
-    from ortools.sat.python import cp_model
+    from ortools.sat.python import cp_model, cp_model_helper
 else:
     try:
-        from ortools.sat.python import cp_model
+        from ortools.sat.python import cp_model, cp_model_helper
 
     except ImportError:  # pragma: no cover - exercised only when ortools is absent
         cp_model = None
@@ -381,14 +381,14 @@ class _SympyExprToCpSat(Printer):
             lambda e: e.args[0],
         )
         logger.debug("[CP-SAT layout solver] cost expr (remove floor): %s", cost_expr)
-        cost_expr = sympy.expand(cost_expr).n()
+        cost_expr = sympy.expand(cost_expr)
         logger.debug("[CP-SAT layout solver] cost expr (expanded): %s", cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.log,
             lambda e: self._log_min(e),
         )
         logger.debug("[CP-SAT layout solver] cost expr (log_min): %s", cost_expr)
-        cost_expr = sympy.expand(cost_expr).n()
+        cost_expr = sympy.expand(cost_expr)
         logger.debug("[CP-SAT layout solver] cost expr (expanded): %s", cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.log,
@@ -400,6 +400,11 @@ class _SympyExprToCpSat(Printer):
             lambda e: self._inv_sym(e),
         )
         logger.debug("[CP-SAT layout solver] cost expr (inv_sym): %s", cost_expr)
+        cost_expr = cost_expr.replace(
+            lambda e: e.func == sympy.Mul,
+            lambda e: self._min_expand(e),
+        )
+        logger.debug("[CP-SAT layout solver] cost expr (min_expand): %s", cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func in [sympy.Min, sympy.Max],
             lambda e: self._truncate_floats_min(e),
@@ -433,6 +438,8 @@ class _SympyExprToCpSat(Printer):
             return sympy.Symbol(
                 f"log_{arg.name}", integer=True, nonnegative=True
             ) * sympy.log(2.0)
+        elif isinstance(arg, sympy.Number):
+            return math.log(float(arg))
         else:
             return expr
 
@@ -454,6 +461,19 @@ class _SympyExprToCpSat(Printer):
             )
         else:
             return expr
+
+    @staticmethod
+    def _min_expand(expr):
+        # re-writes 2.1*Min(x, y) as Min(2.1*x, 2.1*y)
+        if len(expr.args) != 2 or not isinstance(expr.args[0], sympy.Number):
+            return expr
+        arg = expr.args[1]
+        if not isinstance(arg, (sympy.Min, sympy.Max)):
+            return expr
+        m = expr.args[0]
+        new_args = [a * abs(m) for a in arg.args]
+        new_args = [a.replace(lambda e: e.func == sympy.Mul, lambda e: _SympyExprToCpSat._min_expand(e)) for a in new_args]
+        return arg.func(*new_args) * sympy.sign(m)
 
     @staticmethod
     def _truncate_floats_min(expr):
@@ -496,11 +516,11 @@ class _SympyExprToCpSat(Printer):
             return math.prod(args)
 
         nonints = [arg for arg in args if not isinstance(arg, cp_model.IntVar)]
-        lb, ub = map(math.prod, zip(*[self._affine_bounds(arg) for arg in args]))
+        lb, ub = map(math.prod, zip(*[self._affine_bounds(arg) for arg in ints]))
         name = "product_" + "_".join([arg.name for arg in ints])
         if name in self._sym_map:
             return self._sym_map[name]
-        product = self._model.NewIntVar(int(lb), int(ub), name)
+        product = self._model.new_int_var(int(lb), int(ub), name)
         self._model.AddMultiplicationEquality(product, ints)
         self._sym_map[name] = product
         return math.prod(nonints) * product
@@ -512,41 +532,46 @@ class _SympyExprToCpSat(Printer):
         return self._print(expr.base) ** self._print(expr.pow)
 
     def _print_log(self, expr):
+        if isinstance(expr.args[0], sympy.Number):
+            return math.log(float(expr.args[0]))
         raise NotImplementedError(f"log not implemented. expr: {expr}")
 
     @staticmethod
     def _affine_bounds(expr):
         if isinstance(expr, cp_model.IntVar):
-            return expr.domain.min(), expr.domain.max()
-        if isinstance(expr, (int, float)):
-            return expr, expr
-        if (
-            hasattr(expr, "coefficient")
-            and hasattr(expr, "offset")
-            and hasattr(expr, "expression")
-        ):
+            lb, ub = expr.domain.min(), expr.domain.max()
+        elif isinstance(expr, (int, float)):
+            lb, ub = expr, expr
+        elif isinstance(expr, cp_model_helper.IntAffine):
             lb, ub = _SympyExprToCpSat._affine_bounds(expr.expression)
-            c, o = expr.coefficient, expr.offset
-            return (c * lb + o, c * ub + o) if c >= 0 else (c * ub + o, c * lb + o)
-        if hasattr(expr, "num_exprs"):
+            c, o = int(expr.coefficient), int(expr.offset)
+            lb, ub = (c * lb + o, c * ub + o) if c >= 0 else (c * ub + o, c * lb + o)
+        elif hasattr(expr, "num_exprs"):
             # SumArray (e.g. from ``a + b + c`` or ``sum(...)``): flatten to a
             # single offset + per-var coefficients and bound each term.
             flat = cp_model.FlatIntExpr(expr)
-            lb = ub = flat.offset
+            lb = ub = int(flat.offset)
             for var, c in zip(flat.vars, flat.coeffs):
+                c = int(c)
                 vlb, vub = _SympyExprToCpSat._affine_bounds(var)
                 if c >= 0:
-                    lb, ub = lb + c * vlb, ub + c * vub
+                    vlb, vub = c * vlb, c * vub
                 else:
-                    lb, ub = lb + c * vub, ub + c * vlb
-            return lb, ub
-        raise TypeError(f"unsupported expr type: {type(expr)}")
+                    vlb, vub = c * vub, c * vlb
+                lb, ub = lb + vlb, ub + vub
+                assert lb <= ub
+        else:
+            raise TypeError(f"unsupported expr type: {type(expr)}")
+
+        lb, ub = int(lb), int(ub)
+        assert lb <= ub
+        return lb, ub
 
     def _print_Max(self, expr):
         # max range is (max(mins), max(maxes))
         args = [self._print(arg) for arg in expr.args]
         bounds = map(max, zip(*[self._affine_bounds(arg) for arg in args]))
-        max_var = self._model.NewIntVar(*bounds, f"max_var_{self._count}")
+        max_var = self._model.new_int_var(*bounds, f"max_var_{self._count}")
         self._model.AddMaxEquality(max_var, args)
         self._count += 1
         return max_var
@@ -555,7 +580,7 @@ class _SympyExprToCpSat(Printer):
         # min range is (min(mins), min(maxes))
         args = [self._print(arg) for arg in expr.args]
         bounds = map(min, zip(*[self._affine_bounds(arg) for arg in args]))
-        min_var = self._model.NewIntVar(*bounds, f"min_var_{self._count}")
+        min_var = self._model.new_int_var(*bounds, f"min_var_{self._count}")
         self._model.AddMinEquality(min_var, args)
         self._count += 1
         return min_var
