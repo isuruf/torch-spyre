@@ -140,6 +140,10 @@ class LifetimeBoundBuffer:
         """Returns true iff self and other overlap in time."""
         return self.start_time < other.end_time and other.start_time < self.end_time
 
+    @property
+    def sym_is_lx(self) -> sympy.Symbol:
+        return sympy.Symbol(f"is_lx_{self.name}", integer=True, nonnegative=True)
+
 
 @dataclass
 class CoreDivision:
@@ -215,10 +219,6 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         return min(
             ceil_div(self.size, cd.output_partition) for cd in self.core_divisions
         )
-
-    @property
-    def sym_is_lx(self) -> sympy.Symbol:
-        return sympy.Symbol(f"is_lx_{self.name}", integer=True, nonnegative=True)
 
     @property
     def sym_cores(self) -> sympy.Symbol:
