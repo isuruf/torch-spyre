@@ -1256,6 +1256,7 @@ def _matmul_split_cost(
     m_t = M // m if m else 1
     pt_passes = max(1.0, m_t / _PT_ROWS)
     pt_eff = (
+        # TODO: allow symbolic
         1.0
         if is_symbolic
         else min(1.0, (pt_passes / _TARGET_PT_PASSES) ** _PT_EFFICIENCY_EXPONENT)
