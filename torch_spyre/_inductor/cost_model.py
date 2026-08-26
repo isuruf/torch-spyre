@@ -1271,28 +1271,7 @@ def _matmul_axes_for_split_cost(o) -> tuple | None:
     and the cores actually used -- everything ``work_division._matmul_split_cost``
     needs -- from one matmul :class:`OpFeatures` record.
 
-    ``OpFeatures`` does not carry the batch size or its core split directly, so both are
-    backed out:
-
-    * ``M = matmul_rows_per_core * matmul_m_split``, ``N = matmul_cols_per_core *
-      matmul_n_split`` (already stored per-core, excluding batch -- see
-      ``dump_cost_model._matmul_features``).
-    * ``K`` is recovered from ``matmul_a_bytes = M*K*dtype_bytes`` (falling back to
-      ``matmul_b_bytes = K*N*dtype_bytes`` if the first is unset).
-    * ``B`` (total batch) falls out of ``out_elems = B*M*N`` (the device output already
-      includes the batch dim).
-    * the batch SPLIT ``b`` is not tracked at all -- it is backed out from ``cores =
-      b*m*n*k`` (``OpFeatures.cores`` is the op's own total active core count).
-    * ``shared_weight`` (an unbatched RHS broadcast across the batch) is read off the
-      ``broadcast`` flag already computed for the op's input args -- a shared weight's
-      read index has fewer free symbols than the output rank, which is exactly what
-      that flag encodes.
-
-    Returns ``None`` when a needed quantity is symbolic (sympy, under the CP-SAT
-    co-optimizing allocator -- see ``scratchpad/allocator.py``) or otherwise
-    unresolvable, so the caller can fall back to a placeholder:
-    ``_matmul_split_cost`` itself does concrete int/log2/comparison arithmetic and is
-    not symbolic-aware.
+    Returns ``None`` when matmul_a_bytes and matmul_b_bytes are not given
     """
     m_split = max(1, o.matmul_m_split)
     n_split = max(1, o.matmul_n_split)
