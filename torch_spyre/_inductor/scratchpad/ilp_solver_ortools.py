@@ -373,36 +373,29 @@ class _SympyExprToCpSat(Printer):
             lambda e: e.func == sympy.floor,
             lambda e: e.args[0],
         )
-        logger.debug("[CP-SAT layout solver] cost expr (remove floor): %s", cost_expr)
         cost_expr = sympy.expand(cost_expr)
-        logger.debug("[CP-SAT layout solver] cost expr (expanded): %s", cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.log,
             lambda e: self._log_min(e),
         )
-        logger.debug("[CP-SAT layout solver] cost expr (log_min): %s", cost_expr)
         cost_expr = sympy.expand(cost_expr)
-        logger.debug("[CP-SAT layout solver] cost expr (expanded): %s", cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.log,
             lambda e: self._log_split(e),
         )
-        logger.debug("[CP-SAT layout solver] cost expr (log_split): %s", cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.Pow,
             lambda e: self._inv_sym(e),
         )
-        logger.debug("[CP-SAT layout solver] cost expr (inv_sym): %s", cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.Mul,
             lambda e: self._min_expand(e),
         )
-        logger.debug("[CP-SAT layout solver] cost expr (min_expand): %s", cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func in [sympy.Min, sympy.Max],
             lambda e: self._truncate_floats_min(e),
         )
-        logger.debug("[CP-SAT layout solver] cost expr (truncated): %s", cost_expr)
+        logger.debug("[CP-SAT layout solver] cost expr (linearized): %s", cost_expr)
         return self._print(cost_expr)
 
     @classmethod
@@ -781,8 +774,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
             try:
                 cp_cost = _SympyExprToCpSat(model, sym_map).convert(cost_expr)
-
-                logger.debug("[CP-SAT layout solver] cost model expr: %s", cp_cost)
                 if not isinstance(cp_cost, (int, float)):
                     # if the cost is non-constant, we minimize it
                     # if the cost is constant, we use any solution
@@ -792,6 +783,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     raise SolveError("CP-SAT memory planner found no feasible plan")
             except (RuntimeError, TypeError):
                 cost_expr = None
+                logger.debug("[CP-SAT layout solver] cannot linearize the sympy expr")
 
         if cost_expr is None:
             hbm_terms = [

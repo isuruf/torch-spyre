@@ -1732,9 +1732,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 dict(cd.reduction_splits),
             )
             if orig != op.op_it_space_splits:
-                print(
-                    "core division optimizing (%s): %s → %s"
-                    % (self._get_op_name(op), orig, op.op_it_space_splits)
+                logger.debug(
+                    "core division for %s changed: %s → %s",
+                    self._get_op_name(op),
+                    orig,
+                    op.op_it_space_splits,
                 )
 
     def _determine_in_place_division_invariant(
