@@ -120,6 +120,11 @@ _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
 # LifetimeBoundBuffer; the joint subclass binds this to CoreDivisionBuffer.
 _BufT = TypeVar("_BufT", bound=LifetimeBoundBuffer)
 
+# constant to scale log of core split. error ~0.5%
+_CORE_LOG_SCALE = 32.0
+# constant to scale inverse of core split. error ~1%
+_CORE_INV_SCALE = 1024.0
+
 
 @dataclass
 class _PlacementUnit:
@@ -281,9 +286,9 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         self.inv_cores = m.new_int_var(0, max(inv_cores_used), f"inv_cores_{b.name}")
 
         sym_core_divs = b.sym_core_divs
+
         cp_core_divs = ({}, {})
-        cp_inv_core_divs = ({}, {})
-        cp_log_core_divs = ({}, {})
+        cp_core_divs_raw = ({}, {})
         for i, split_type in enumerate(["output_splits", "reduction_splits"]):
             splits = sym_core_divs[i]
             for key, symbol in splits.items():
@@ -292,22 +297,10 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
                 cp_var = m.new_int_var(1, config.sencores, f"{symbol.name}")
                 m.add_element(self.division, raw, cp_var)
                 cp_core_divs[i][key] = cp_var
-
-                inv_values = [config.sencores // v for v in raw]
-                cp_inv_var = m.new_int_var(1, config.sencores, f"inv_{symbol.name}")
-                m.add_element(self.division, inv_values, cp_inv_var)
-                cp_inv_core_divs[i][key] = cp_inv_var
-
-                log_values = [round(math.log2(v)) for v in raw]
-                cp_log_var = m.new_int_var(
-                    0, int(math.log2(config.sencores)), f"log_{symbol.name}"
-                )
-                m.add_element(self.division, log_values, cp_log_var)
-                cp_log_core_divs[i][key] = cp_log_var
+                cp_core_divs_raw[i][key] = raw
 
         self.cp_core_divs = cp_core_divs
-        self.cp_inv_core_divs = cp_inv_core_divs
-        self.cp_log_core_divs = cp_log_core_divs
+        self.cp_core_divs_raw = cp_core_divs_raw
 
         # tie per-core footprint (output split only) and total core usage to the
         # chosen division index
@@ -435,9 +428,11 @@ class _SympyExprToCpSat(Printer):
     def _log_split(cls, expr):
         arg = expr.args[0]
         if isinstance(arg, sympy.Symbol) and "_split_" in arg.name:
-            return sympy.Symbol(
-                f"log_{arg.name}", integer=True, nonnegative=True
-            ) * sympy.log(2.0)
+            return (
+                sympy.Symbol(f"log2_{arg.name}", integer=True, nonnegative=True)
+                * sympy.log(2.0)
+                / _CORE_LOG_SCALE
+            )
         elif isinstance(arg, sympy.Number):
             return math.log(float(arg))
         else:
@@ -452,12 +447,12 @@ class _SympyExprToCpSat(Printer):
         symbol = expr.base
         if (
             "_split_" in symbol.name
-            and "log_" not in symbol.name
+            and "log2_" not in symbol.name
             and "inv_" not in symbol.name
         ):
             return (
                 sympy.Symbol(f"inv_{symbol.name}", integer=True, nonnegative=True)
-                / config.sencores
+                / _CORE_INV_SCALE
             )
         else:
             return expr
@@ -472,7 +467,13 @@ class _SympyExprToCpSat(Printer):
             return expr
         m = expr.args[0]
         new_args = [a * abs(m) for a in arg.args]
-        new_args = [a.replace(lambda e: e.func == sympy.Mul, lambda e: _SympyExprToCpSat._min_expand(e)) for a in new_args]
+        new_args = [
+            a.replace(
+                lambda e: e.func == sympy.Mul,
+                lambda e: _SympyExprToCpSat._min_expand(e),
+            )
+            for a in new_args
+        ]
         return arg.func(*new_args) * sympy.sign(m)
 
     @staticmethod
@@ -516,17 +517,41 @@ class _SympyExprToCpSat(Printer):
             return math.prod(args)
 
         nonints = [arg for arg in args if not isinstance(arg, cp_model.IntVar)]
-        lb, ub = map(math.prod, zip(*[self._affine_bounds(arg) for arg in ints]))
-        name = "product_" + "_".join([arg.name for arg in ints])
+        name = "_product_" + "_".join([arg.name for arg in ints])
         if name in self._sym_map:
-            return self._sym_map[name]
+            return math.prod(nonints) * self._sym_map[name]
+
+        lbs, ubs = list(zip(*[self._affine_bounds(arg) for arg in ints]))
+        assert all(lb >= 0 for lb in lbs)
+        assert all(ub >= 0 for ub in ubs)
+        lb, ub = map(math.prod, lbs, ubs)
         product = self._model.new_int_var(int(lb), int(ub), name)
         self._model.AddMultiplicationEquality(product, ints)
         self._sym_map[name] = product
         return math.prod(nonints) * product
 
     def _print_Symbol(self, expr):
-        return self._sym_map[expr.name]
+        if expr.name in self._sym_map:
+            return self._sym_map[expr.name]
+        if not expr.name.startswith(("log2_", "inv_")):
+            raise NotImplementedError(f"not implemented. expr: {expr}")
+        name = expr.name[5:] if expr.name.startswith("log2_") else expr.name[4:]
+        b = self._sym_map[f"_buffer_{name}"]
+        raw = self._sym_map[f"_raw_{name}"]
+
+        if expr.name.startswith("log2_"):
+            values = [int(round(_CORE_LOG_SCALE * math.log2(v))) for v in raw]
+            domain = cp_model.Domain.FromValues(values)
+            cp_var = self._model.new_int_var_from_domain(domain, expr.name)
+            self._model.add_element(b.division, values, cp_var)
+        else:
+            values = [int(round(_CORE_INV_SCALE // v)) for v in raw]
+            cp_var = self._model.new_int_var(min(values), max(values), expr.name)
+            self._model.AddDivisionEquality(
+                cp_var, _CORE_INV_SCALE, self._sym_map[name]
+            )
+        self._sym_map[expr.name] = cp_var
+        return cp_var
 
     def _print_Pow(self, expr):
         return self._print(expr.base) ** self._print(expr.pow)
@@ -743,17 +768,16 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             for t in tensors.values():
                 sym_map[t.buffer.sym_is_lx.name] = t.in_buffer
                 sym_core_divs = t.buffer.sym_core_divs
-                for splits, cp_splits, cp_inv_splits, cp_log_splits in zip(
+                for splits, cp_splits, cp_splits_raw in zip(
                     sym_core_divs,
                     t.cp_core_divs,
-                    t.cp_inv_core_divs,
-                    t.cp_log_core_divs,
+                    t.cp_core_divs_raw,
                 ):
                     for key, symbol in splits.items():
                         assert isinstance(symbol, sympy.Symbol)
                         sym_map[symbol.name] = cp_splits[key]
-                        sym_map[f"inv_{symbol.name}"] = cp_inv_splits[key]
-                        sym_map[f"log_{symbol.name}"] = cp_log_splits[key]
+                        sym_map[f"_buffer_{symbol.name}"] = t
+                        sym_map[f"_raw_{symbol.name}"] = cp_splits_raw[key]
 
             try:
                 cp_cost = _SympyExprToCpSat(model, sym_map).convert(cost_expr)
