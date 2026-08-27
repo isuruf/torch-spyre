@@ -99,6 +99,15 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     materialize_lx_relayouts,
 )
 from torch_spyre._inductor.pass_utils import _is_matmul_op
+from torch_spyre._inductor.cost_model import predict_ops, CostParams
+
+_COST_PARAMS = CostParams(
+    # we need a expression of both compute, mem_t
+    # whereas the default gives max(compute, mem_t)
+    # which optimizes compute only when there's a matmul
+    overlap_gamma=0.46,
+    use_bundled_cost_model=False,
+)
 
 logger = get_inductor_logger("scratchpad.allocator")
 
@@ -1566,16 +1575,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             op_features.append(self._extract_op_features(graph, output_name, bufmap))
 
-        from torch_spyre._inductor.cost_model import predict_ops, CostParams
-
-        params = CostParams(
-            # we need a expression of both compute, mem_t
-            # whereas the default gives max(compute, mem_t)
-            # which optimizes compute only when there's a matmul
-            overlap_gamma=0.46,
-            use_bundled_cost_model=False,
-        )
-        cost_expr = sympy.sympify(predict_ops(op_features, params=params))
+        cost_expr = sympy.sympify(predict_ops(op_features, params=_COST_PARAMS))
         result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
             "CoOptimizingAllocator does not support LX relayout"

@@ -54,17 +54,13 @@ from __future__ import annotations
 from collections.abc import Sequence, Set as AbstractSet
 from typing import Optional
 
-from torch_spyre._inductor.cost_model import CostParams, OpFeatures, predict_ops
+from torch_spyre._inductor.cost_model import OpFeatures, predict_ops
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.scratchpad import cooptimization_scorer as scorer
 from torch_spyre._inductor.scratchpad.op_features import with_residency
+from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
 
 logger = get_inductor_logger("scratchpad.cost_objective")
-
-# Must match the parameterization CoOptimizingAllocator._solve uses to build its
-# ILP objective, or the two halves of the co-optimization minimize different
-# functions. predict_ops' own defaults are neither of these values.
-_COST_PARAMS = CostParams(overlap_gamma=0.46, use_bundled_cost_model=False)
 
 
 class BundleCostObjective:
