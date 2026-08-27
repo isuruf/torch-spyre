@@ -25,6 +25,7 @@ against device measurements (``examples/bench_*``); the model is only as good as
 this extraction.
 """
 
+import math
 import os
 
 from torch._inductor.ir import ComputedBuffer
@@ -95,7 +96,7 @@ def _cores(op, work_slices=None) -> int:
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
-        return _prod_ints(
+        return math.prod(
             _work_slices(op, write_index, read_index, it_space, work_slices).values()
         )
     except Exception:  # noqa: BLE001 - best-effort feature extraction
@@ -498,7 +499,7 @@ def extract_op_features(
     out_dims = _device_dims(op.get_layout()) or out_size
     out_elems = _prod_ints(out_dims)
 
-    cores = buf.sym_cores if buf else _cores(op, work_slices)
+    cores = _cores(op, work_slices)
 
     # Cross-core ring combine: work division splits OUTPUT dims first, then the reduced
     # axis with leftover cores -> the reduced axis is split only when out_elems < cores.
