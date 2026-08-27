@@ -733,6 +733,44 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     # ------------------------------------------------------------------
     # Model build + solve
     # ------------------------------------------------------------------
+    def _minimize_cost_expr(
+        self,
+        model: "cp_model.CpModel",
+        solver: "cp_model.CpSolver",
+        tensors: dict[str, _LifetimeBufferWithCpVars],
+        cost_expr: sympy.Expr,
+    ) -> Optional["cp_model.CpSolverStatus"]:
+        sym_map = {}
+        for t in tensors.values():
+            sym_map[t.buffer.sym_is_lx.name] = t.in_buffer
+            sym_core_divs = t.buffer.sym_core_divs
+            for splits, cp_splits, cp_splits_raw in zip(
+                sym_core_divs,
+                t.cp_core_divs,
+                t.cp_core_divs_raw,
+            ):
+                for key, symbol in splits.items():
+                    assert isinstance(symbol, sympy.Symbol)
+                    sym_map[symbol.name] = cp_splits[key]
+                    sym_map[f"_buffer_{symbol.name}"] = t
+                    sym_map[f"_raw_{symbol.name}"] = cp_splits_raw[key]
+
+        try:
+            cp_cost = _SympyExprToCpSat(model, sym_map).convert(cost_expr)
+            if not isinstance(cp_cost, (int, float)):
+                # if the cost is non-constant, we minimize it
+                # if the cost is constant, we use any solution
+                model.minimize(cp_cost)
+            status = solver.Solve(model)
+            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                raise SolveError("CP-SAT memory planner found no feasible plan")
+            return status
+        except (RuntimeError, TypeError):
+            if not config._cpsat_warn_on_cost_expr:
+                raise
+            logger.debug("[CP-SAT layout solver] cannot linearize the sympy expr")
+            return None
+
     def _run(
         self,
         model: "cp_model.CpModel",
@@ -753,41 +791,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0
 
-        status = cp_model.INFEASIBLE
+        status = None
         core_terms = None
 
         if cost_expr is not None:
-            sym_map = {}
-            for t in tensors.values():
-                sym_map[t.buffer.sym_is_lx.name] = t.in_buffer
-                sym_core_divs = t.buffer.sym_core_divs
-                for splits, cp_splits, cp_splits_raw in zip(
-                    sym_core_divs,
-                    t.cp_core_divs,
-                    t.cp_core_divs_raw,
-                ):
-                    for key, symbol in splits.items():
-                        assert isinstance(symbol, sympy.Symbol)
-                        sym_map[symbol.name] = cp_splits[key]
-                        sym_map[f"_buffer_{symbol.name}"] = t
-                        sym_map[f"_raw_{symbol.name}"] = cp_splits_raw[key]
+            status = self._minimize_cost_expr(model, solver, tensors, cost_expr)
 
-            try:
-                cp_cost = _SympyExprToCpSat(model, sym_map).convert(cost_expr)
-                if not isinstance(cp_cost, (int, float)):
-                    # if the cost is non-constant, we minimize it
-                    # if the cost is constant, we use any solution
-                    model.minimize(cp_cost)
-                status = solver.Solve(model)
-                if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    raise SolveError("CP-SAT memory planner found no feasible plan")
-            except (RuntimeError, TypeError):
-                if not config._cpsat_warn_on_cost_expr:
-                    raise
-                cost_expr = None
-                logger.debug("[CP-SAT layout solver] cannot linearize the sympy expr")
-
-        if cost_expr is None:
+        if status is None:
             hbm_terms = [
                 sb.spill_cost() * (1 - sb.in_buffer) for sb in tensors.values()
             ]
@@ -819,6 +829,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         final_tensors = self._extract(solver, tensors)
 
         if logger.isEnabledFor(logging.DEBUG):
+            if status is None:
+                status = cp_model.INFEASIBLE
             spilled = [n for n, t in final_tensors.items() if t.address is None]
             logger.debug(
                 "[CP-SAT layout solver] tensors=%d resident=%d %s=%d "

@@ -1591,7 +1591,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             getattr(op, "name", None) for op in graph.operations
         }
         if unscored:
-            logger.warning(
+            logger.debug(
                 "cost objective omits %d buffer(s) absent from graph.operations: %s",
                 len(unscored),
                 sorted(unscored),
