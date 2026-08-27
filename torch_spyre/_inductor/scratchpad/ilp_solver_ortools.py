@@ -123,7 +123,7 @@ _BufT = TypeVar("_BufT", bound=LifetimeBoundBuffer)
 # constant to scale log of core split. error ~0.5%
 _CORE_LOG_SCALE = 32.0
 # constant to scale inverse of core split. error ~1%
-_CORE_INV_SCALE = 1024.0
+_CORE_INV_SCALE = 1024
 
 
 @dataclass
@@ -517,7 +517,7 @@ class _SympyExprToCpSat(Printer):
         lbs, ubs = list(zip(*[self._affine_bounds(arg) for arg in ints]))
         assert all(lb >= 0 for lb in lbs)
         assert all(ub >= 0 for ub in ubs)
-        lb, ub = map(math.prod, lbs, ubs)
+        lb, ub = map(math.prod, [lbs, ubs])
         product = self._model.new_int_var(int(lb), int(ub), name)
         self._model.AddMultiplicationEquality(product, ints)
         self._sym_map[name] = product
@@ -541,7 +541,7 @@ class _SympyExprToCpSat(Printer):
             values = [int(round(_CORE_INV_SCALE // v)) for v in raw]
             cp_var = self._model.new_int_var(min(values), max(values), expr.name)
             self._model.AddDivisionEquality(
-                cp_var, _CORE_INV_SCALE, self._sym_map[name]
+                cp_var, int(_CORE_INV_SCALE), self._sym_map[name]
             )
         self._sym_map[expr.name] = cp_var
         return cp_var
