@@ -467,16 +467,19 @@ def _hbm_pattern(op, is_reduction: bool, out_dims) -> str:
         return ""
 
 
-def extract_op_features(op, work_slices=None, buffers: Optional[Mapping[str, "LifetimeBoundBuffer"]] = None) -> OpFeatures:
+def extract_op_features(
+    op, work_slices=None, buffers: Optional[Mapping[str, "LifetimeBoundBuffer"]] = None
+) -> OpFeatures:
     """Build OpFeatures for one ComputedBuffer op (best-effort).
 
     ``work_slices`` is a complete symbol-keyed candidate division during LX
     planning. Otherwise committed pre-scheduler ownership is used, falling back
     to legacy coefficient-keyed Scheduler transport after finalization.
-    
+
     buffers is an optional name -> LifetimeBoundBuffer map used for creating a
     symbolic cost model.
     """
+    buf = buffers.get(op.name) if buffers else None
     data = getattr(op, "data", None)
     is_reduction = getattr(data, "reduction_type", None) is not None
     loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)

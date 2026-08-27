@@ -100,7 +100,6 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     collect_lx_relayout_plans,
     materialize_lx_relayouts,
 )
-from torch_spyre._inductor.pass_utils import _is_matmul_op
 from torch_spyre._inductor.cost_model import CostParams
 
 _COST_PARAMS = CostParams(
@@ -1614,9 +1613,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         from torch_spyre._inductor.scratchpad.op_features import _work_slices
 
         sym_core_divs = buffers[output_name].sym_core_divs
-        ws = _work_slices(CoreDivision(sym_core_divs[0], sym_core_divs[1]))
         op = graph.get_buffer(output_name)
-        return extract_op_features(op, buffers, ws)
+        ws = _work_slices(op, CoreDivision(sym_core_divs[0], sym_core_divs[1]))
+        return extract_op_features(op, ws, buffers=buffers)
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         # The divisions must be committed such that any buffer clones can correctly
