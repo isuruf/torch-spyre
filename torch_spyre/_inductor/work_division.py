@@ -1424,7 +1424,7 @@ def _matmul_split_cost(
     """
     (B, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k
-    if cores_used == 0 or cores_used > max_cores:
+    if cores_used == 0 or (isinstance(cores_used, int) and cores_used > max_cores):
         return float("inf")
 
     num_elems = B * M * N * K

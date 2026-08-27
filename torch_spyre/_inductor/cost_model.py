@@ -149,6 +149,7 @@ import math
 import sympy
 
 from .work_division import _matmul_split_cost, min, max, log2
+from . import config
 
 
 @dataclasses.dataclass
@@ -1291,7 +1292,6 @@ def _matmul_axes_for_split_cost(o) -> tuple | None:
         return None
     B_total = max(1.0, o.out_elems / (M * N))
     b_split = o.cores // (m_split * n_split * k_split)
-    cores_used = b_split * m_split * n_split * k_split
     shared_weight = any(a.role == "input" and a.broadcast for a in o.args)
     return (
         (round(B_total), b_split),
@@ -1299,7 +1299,6 @@ def _matmul_axes_for_split_cost(o) -> tuple | None:
         (round(N), n_split),
         (round(K), k_split),
         shared_weight,
-        cores_used,
     )
 
 
@@ -1323,17 +1322,18 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
                 "matmul_a_bytes/matmul_b_bytes) -- the UPSTREAM matmul cost model "
                 "cannot price it"
             )
-        b_axis, m_axis, n_axis, k_axis, shared_weight, cores_used = axes
+        b_axis, m_axis, n_axis, k_axis, shared_weight = axes
         us = _matmul_split_cost(
             b_axis,
             m_axis,
             n_axis,
             k_axis,
-            cores_used,
+            config.sencores,
             shared_weight=shared_weight,
             include_hbm=False,
         )
         if us == float("inf"):
+            cores_used = b_axis[1] * m_axis[1] * n_axis[1] * k_axis[1]
             raise RuntimeError(
                 f"matmul op {o.name!r} has an infeasible core split "
                 f"(b_axis={b_axis}, m_axis={m_axis}, n_axis={n_axis}, "
@@ -1720,16 +1720,17 @@ def explain(ops: list, params: CostParams | None = None) -> str:
                     "matmul_a_bytes/matmul_b_bytes) -- the UPSTREAM matmul cost model "
                     "cannot price it"
                 )
-            (B, b), (M, m), (N, n), (K, k), shared_weight, cores_used = axes
+            (B, b), (M, m), (N, n), (K, k), shared_weight = axes
             us = _matmul_split_cost(
                 (B, b),
                 (M, m),
                 (N, n),
                 (K, k),
-                cores_used,
+                config.sencores,
                 shared_weight=shared_weight,
                 include_hbm=False,
             )
+            cores_used = b * m * n * k
             if us == float("inf"):
                 raise RuntimeError(
                     f"matmul op {o.name!r} has an infeasible core split "
