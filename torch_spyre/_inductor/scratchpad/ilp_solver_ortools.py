@@ -782,6 +782,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     raise SolveError("CP-SAT memory planner found no feasible plan")
             except (RuntimeError, TypeError):
+                if not config._cpsat_warn_on_cost_expr:
+                    raise
                 cost_expr = None
                 logger.debug("[CP-SAT layout solver] cannot linearize the sympy expr")
 
