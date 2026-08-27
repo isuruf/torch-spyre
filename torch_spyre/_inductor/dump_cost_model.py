@@ -498,7 +498,7 @@ def extract_op_features(
     out_dims = _device_dims(op.get_layout()) or out_size
     out_elems = _prod_ints(out_dims)
 
-    cores = _cores(op, work_slices)
+    cores = buf.sym_cores if buf else _cores(op, work_slices)
 
     # Cross-core ring combine: work division splits OUTPUT dims first, then the reduced
     # axis with leftover cores -> the reduced axis is split only when out_elems < cores.

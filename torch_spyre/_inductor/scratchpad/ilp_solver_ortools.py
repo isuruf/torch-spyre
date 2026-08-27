@@ -547,7 +547,7 @@ class _SympyExprToCpSat(Printer):
         return cp_var
 
     def _print_Pow(self, expr):
-        return self._print(expr.base) ** self._print(expr.pow)
+        return self._print(expr.base) ** self._print(expr.exp)
 
     def _print_log(self, expr):
         if isinstance(expr.args[0], sympy.Number):
