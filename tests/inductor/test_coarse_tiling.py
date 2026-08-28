@@ -71,6 +71,7 @@ from torch_spyre._inductor.constants import (
     SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
+from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.loop_info import CoarseTileInfo, copy_op_metadata
 from torch_spyre._inductor.pass_utils import coeff_through_floor
@@ -633,10 +634,12 @@ def _make_tiled_op_spec() -> OpSpec:
         allocation={"hbm": 0x2000},
         device_tile_advance_expr=tile_advance_expr,
     )
+    iteration_space = {c0: (Integer(128), 1)}
     return OpSpec(
         op="abs",
         is_reduction=False,
-        iteration_space={c0: (Integer(128), 1)},
+        iteration_space=iteration_space,
+        core_id_to_work_slice=derive_operation_mapping(iteration_space),
         args=[tensor_in, tensor_out],
         op_info={},
         tiled_symbols=[[c0]],
@@ -1402,6 +1405,37 @@ class TestCodegenOpSpecListRoundtrip(unittest.TestCase):
 
 
 class TestDivideRanges(unittest.TestCase):
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def _make_named_pointwise(self, ranges, names):
+        from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
+
+        from torch_spyre._inductor.pass_utils import iteration_space_from_op
+
+        data = Pointwise(
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            inner_fn=lambda index: sympy.Integer(0),
+            ranges=list(ranges),
+        )
+        op = ComputedBuffer(
+            name="named_pointwise",
+            layout=FixedLayout(torch.device("cpu"), torch.float16, list(ranges), None),
+            data=data,
+        )
+        symbols = tuple(iteration_space_from_op(op))
+        self.assertEqual(len(symbols), len(names))
+        op.work_div_loop_info = {  # type: ignore[attr-defined]
+            symbol: [name] for symbol, name in zip(symbols, names)
+        }
+        return op
+
     def test_pointwise_single_dim_divided(self):
         data = _make_pointwise([Integer(64)])
         op = _make_op(data)
@@ -1422,6 +1456,69 @@ class TestDivideRanges(unittest.TestCase):
         _divide_ranges(op, Integer(4), tiled_dims=[0])
         self.assertEqual(data.ranges[0], Integer(8))
         self.assertEqual(data.ranges[1], Integer(8))
+
+    def test_named_token_split_survives_expert_dim_squeeze(self):
+        from torch_spyre._inductor.pass_utils import iteration_space_from_op
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _apply_work_div_symbol_remap,
+        )
+
+        op = self._make_named_pointwise(
+            [Integer(128), Integer(512), Integer(704)], ["E", "T", "F"]
+        )
+
+        result = _divide_ranges(op, Integer(128), tiled_dims=[0])
+        _apply_work_div_symbol_remap(op, result.symbol_remap)
+
+        iteration_space = iteration_space_from_op(op)
+        self.assertEqual(tuple(iteration_space.values()), (Integer(512), Integer(704)))
+        names_by_extent = {
+            iteration_space[symbol]: names
+            for symbol, names in op.work_div_loop_info.items()  # type: ignore[attr-defined]
+        }
+        self.assertEqual(names_by_extent, {Integer(512): ["T"], Integer(704): ["F"]})
+
+    def test_named_dims_compose_across_two_size_one_squeezes(self):
+        from torch_spyre._inductor.pass_utils import iteration_space_from_op
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _apply_work_div_symbol_remap,
+        )
+
+        op = self._make_named_pointwise(
+            [Integer(8), Integer(16), Integer(32)], ["E0", "E1", "T"]
+        )
+
+        first = _divide_ranges(op, Integer(8), tiled_dims=[0])
+        _apply_work_div_symbol_remap(op, first.symbol_remap)
+        second = _divide_ranges(op, Integer(16), tiled_dims=[1])
+        _apply_work_div_symbol_remap(op, second.symbol_remap)
+
+        iteration_space = iteration_space_from_op(op)
+        self.assertEqual(tuple(iteration_space.values()), (Integer(32),))
+        self.assertEqual(
+            list(op.work_div_loop_info.values()),  # type: ignore[attr-defined]
+            [["T"]],
+        )
+
+    def test_non_monotone_symbol_mapping_fails_visibly(self):
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _LogicalIterationSymbol,
+            _order_preserving_symbol_remap,
+        )
+
+        op = MagicMock()
+        op.get_name.return_value = "reordered"
+        before = (
+            _LogicalIterationSymbol(("output", 0), Integer(8), Symbol("d0")),
+            _LogicalIterationSymbol(("output", 1), Integer(16), Symbol("d1")),
+        )
+        after = (
+            _LogicalIterationSymbol(("output", 1), Integer(16), Symbol("d0")),
+            _LogicalIterationSymbol(("output", 0), Integer(8), Symbol("d1")),
+        )
+
+        with self.assertRaisesRegex(Unsupported, "order-preserving dimension mapping"):
+            _order_preserving_symbol_remap(op, before, after)
 
     def test_tiled_dims_indices_0_1(self):
         data = _make_pointwise([Integer(32), Integer(16), Integer(4)])
@@ -2988,14 +3085,16 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
             allocation={"hbm": 0x2000},
             device_tile_advance_expr=tile_advance_expr,
         )
+        iteration_space = {
+            c0: (Integer(2), 1),
+            c1: (Integer(4), 1),
+            c2: (Integer(64), 1),
+        }
         return OpSpec(
             op="add",
             is_reduction=False,
-            iteration_space={
-                c0: (Integer(2), 1),
-                c1: (Integer(4), 1),
-                c2: (Integer(64), 1),
-            },
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
             args=[tensor_in, tensor_out],
             op_info={},
             tiled_symbols=[[c0, c1]],
@@ -3482,6 +3581,7 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
                 op="batchmatmul",
                 is_reduction=True,
                 iteration_space=iteration_space,
+                core_id_to_work_slice=derive_operation_mapping(iteration_space),
                 args=args,
                 op_info=op_info,
             )
@@ -3951,10 +4051,12 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
             allocation={"hbm": 0x3000},
             device_tile_advance_expr=64 * out,
         )
+        iteration_space = {c0: (Integer(128), 1)}
         op = OpSpec(
             op="add",
             is_reduction=False,
-            iteration_space={c0: (Integer(128), 1)},
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
             args=[tensor_in0, tensor_in1, tensor_out],
             op_info={},
             tiled_symbols=[[c0]],
@@ -5531,6 +5633,32 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
         self.assertNotIn(full_buf.get_name(), loaded_by_a)
         self.assertNotIn(full_buf.get_name(), loaded_by_b)
 
+    def test_generated_read_copy_does_not_inherit_positional_work_div_names(self):
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+        )
+
+        op_a, op_b, _full_buf, operations = _make_two_op_shared_read_fixture()
+        for op in (op_a, op_b):
+            op.work_div_loop_info = {  # type: ignore[attr-defined]
+                Symbol("d0"): ["T"]
+            }
+        plans = _plan_read_copies(operations, [((0,), [op_a, op_b], {})])
+
+        _insert_all_read_copy_ops(operations, plans)
+
+        generated = [
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer)
+            and op.get_name().startswith("coarse_tile_read_copy")
+        ]
+        self.assertEqual(len(generated), 1)
+        self.assertFalse(hasattr(generated[0], "work_div_loop_info"))
+
     def test_transposed_read_gets_its_own_copy(self):
         """a+b+a.t()-style: two reads of the same buffer with different
         index expressions must NOT share a copy."""
@@ -6739,6 +6867,14 @@ class TestCoarseTileInfoReductionField(unittest.TestCase):
 class TestDivideReductionRanges(unittest.TestCase):
     """_divide_reduction_ranges divides reduction_ranges, leaves ranges intact."""
 
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
     def _make_reduction_op(self, ranges, reduction_ranges, reduction_type="sum"):
         from torch._inductor.ir import ComputedBuffer, Reduction, ReductionHint
         import torch
@@ -6795,6 +6931,44 @@ class TestDivideReductionRanges(unittest.TestCase):
         _divide_reduction_ranges(op, Integer(4), [1])
         self.assertEqual(op.data.reduction_ranges[0], Integer(64))  # untouched
         self.assertEqual(op.data.reduction_ranges[1], Integer(32))  # divided
+
+    def test_named_output_dims_survive_reduction_dim_squeeze(self):
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _LogicalIterationSymbol,
+            _apply_work_div_symbol_remap,
+            _divide_reduction_ranges,
+        )
+
+        op = self._make_reduction_op(
+            ranges=[Integer(512), Integer(704)],
+            reduction_ranges=[Integer(128)],
+        )
+        before = (
+            _LogicalIterationSymbol(("output", 0), Integer(512), Symbol("d0")),
+            _LogicalIterationSymbol(("output", 1), Integer(704), Symbol("d1")),
+            _LogicalIterationSymbol(("reduction", 0), Integer(128), Symbol("d2")),
+        )
+        after = (
+            _LogicalIterationSymbol(("output", 0), Integer(512), Symbol("d0")),
+            _LogicalIterationSymbol(("output", 1), Integer(704), Symbol("d1")),
+        )
+        op.work_div_loop_info = {  # type: ignore[attr-defined]
+            Symbol("d0"): ["T"],
+            Symbol("d1"): ["F"],
+            Symbol("d2"): ["E"],
+        }
+
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+            side_effect=(before, after),
+        ):
+            remap = _divide_reduction_ranges(op, Integer(128), [0])
+        _apply_work_div_symbol_remap(op, remap)
+
+        self.assertEqual(
+            op.work_div_loop_info,  # type: ignore[attr-defined]
+            {Symbol("d0"): ["T"], Symbol("d1"): ["F"]},
+        )
 
 
 class TestLoopVarToReductionRangesPos(unittest.TestCase):
