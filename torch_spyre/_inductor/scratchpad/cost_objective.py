@@ -57,6 +57,7 @@ from typing import Optional
 
 from torch_spyre._inductor.cost_model import OpFeatures, predict_ops
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
 
 logger = get_inductor_logger("scratchpad.cost_objective")
@@ -189,7 +190,9 @@ class BundleCostObjective:
         else:
             # One rounding step per bundle, then integer accumulation -- see the
             # determinism note in the module docstring.
-            value = utils.to_fixed_us(max(0.0, predict_ops(feats, params=_COST_PARAMS)) / 1000.0)
+            value = utils.to_fixed_us(
+                max(0.0, predict_ops(feats, params=_COST_PARAMS)) / 1000.0
+            )
         self._cache[key] = value
         self.evaluations += 1
         return value

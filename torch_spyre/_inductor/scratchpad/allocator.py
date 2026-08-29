@@ -1653,9 +1653,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # kernel: bundle membership decides input dedup, the arity derate and the
         # underfill derate, so a graph that fuses into several kernels is
         # mispriced when scored flat.
-        cost_expr = sympy.sympify(
-            predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS)
-        )
+        try:
+            cost_expr = sympy.sympify(
+                predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS)
+            )
+        except (ValueError, RuntimeError):
+            cost_expr = None
         result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
             "CoOptimizingAllocator does not support LX relayout"

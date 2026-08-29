@@ -833,7 +833,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
             # Residency (the hard priority): minimize total HBM transfer traffic so
             # as much as possible stays resident in LX.
-            hbm_terms = [sb.spill_cost() * (1 - sb.in_buffer) for sb in tensors.values()]
+            hbm_terms = [
+                sb.spill_cost() * (1 - sb.in_buffer) for sb in tensors.values()
+            ]
             status = cp_model.INFEASIBLE
             if hbm_terms:
                 model.minimize(sum(hbm_terms))

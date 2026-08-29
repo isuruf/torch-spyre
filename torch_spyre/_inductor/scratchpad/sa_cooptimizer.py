@@ -110,7 +110,7 @@ _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
 def _work_slices(op, division: "CoreDivision") -> dict:
     """Restore a complete symbol-keyed split map from a sparse candidate."""
     return {
-        symbol: int(
+        symbol: (
             division.output_splits.get(symbol, division.reduction_splits.get(symbol, 1))
         )
         for symbol in iteration_space_from_op(op)
