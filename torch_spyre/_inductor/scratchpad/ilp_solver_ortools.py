@@ -85,6 +85,7 @@ from __future__ import annotations
 
 import logging
 import math
+import operator
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -262,6 +263,15 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
     def record_division(self, solver: "cp_model.CpSolver") -> None:
         """Write the chosen division back onto the buffer (nothing to record
         when the division is fixed)."""
+
+
+_operator_map = {
+    ">=": operator.ge,
+    "<": operator.lt,
+    "<=": operator.le,
+    ">": operator.gt,
+    "==": operator.eq,
+}
 
 
 @dataclass
@@ -571,6 +581,21 @@ class _SympyExprToCpSat(Printer):
 
     def _print_Pow(self, expr):
         return self._print(expr.base) ** self._print(expr.exp)
+
+    def _print_Piecewise(self, expr):
+        assert len(expr.args) == 2
+        assert expr.args[1] == (0, True)
+        assert expr.args[0][0] == 1
+        piecewise_var = self._model.new_bool_var(f"piecewise_{self._count}")
+        self._count += 1
+        cond = self._print(expr.args[0][1])
+        not_cond = self._print(sympy.Not(expr.args[0][1]))
+        self._model.Add(cond).OnlyEnforceIf(piecewise_var)
+        self._model.Add(not_cond).OnlyEnforceIf(piecewise_var.Not())
+        return piecewise_var
+
+    def _print_Relational(self, expr):
+        return _operator_map[expr.rel_op](*[self._print(arg) for arg in expr.args])
 
     def _print_log(self, expr):
         if isinstance(expr.args[0], sympy.Number):
