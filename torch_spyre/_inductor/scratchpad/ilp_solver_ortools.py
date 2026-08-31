@@ -413,19 +413,15 @@ class _SympyExprToCpSat(Printer):
         )
         cost_expr = sympy.expand(cost_expr)
         cost_expr = cost_expr.replace(
-            lambda e: e.func == sympy.log,
-            lambda e: self._log_split(e),
-        )
-        cost_expr = cost_expr.replace(
-            lambda e: e.func == sympy.Pow,
-            lambda e: self._inv_sym(e),
+            lambda e: e.func in [sympy.log, sympy.Pow],
+            lambda e: self._inv_log_sym(e),
         )
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.Mul,
-            lambda e: self._min_expand(e),
+            lambda e: self._min_piecewise_expand(e),
         )
         cost_expr = cost_expr.replace(
-            lambda e: e.func in [sympy.Min, sympy.Max],
+            lambda e: e.func in [sympy.Min, sympy.Max, sympy.Piecewise],
             lambda e: self._truncate_floats_min(e),
         )
         logger.debug("[CP-SAT layout solver] cost expr (linearized): %s", cost_expr)
@@ -451,65 +447,77 @@ class _SympyExprToCpSat(Printer):
             return expr
 
     @classmethod
-    def _log_split(cls, expr):
+    def _inv_log_sym(cls, expr):
+        # replaces log(sym) with log2_sym and 1/sym with inv_sym
         arg = expr.args[0]
-        if isinstance(arg, sympy.Symbol) and "_split_" in arg.name:
-            return (
-                sympy.Symbol(f"log2_{arg.name}", integer=True, nonnegative=True)
-                * sympy.log(2.0)
-                / _CORE_LOG_SCALE
-            )
-        elif isinstance(arg, sympy.Number):
-            return math.log(float(arg))
-        else:
-            return expr
-
-    @classmethod
-    def _inv_sym(cls, expr):
-        if not isinstance(expr.base, sympy.Symbol):
-            return expr
-        if expr.exp != -1:
-            return expr
-        symbol = expr.base
-        if (
-            "_split_" in symbol.name
-            and "log2_" not in symbol.name
-            and "inv_" not in symbol.name
-        ):
-            return (
-                sympy.Symbol(f"inv_{symbol.name}", integer=True, nonnegative=True)
-                / _CORE_INV_SCALE
-            )
-        else:
-            return expr
+        if expr.func == sympy.log:
+            if isinstance(arg, sympy.Symbol) and "_split_" in arg.name:
+                return (
+                    sympy.Symbol(f"log2_{arg.name}", integer=True, nonnegative=True)
+                    * sympy.log(2.0)
+                    / _CORE_LOG_SCALE
+                )
+            elif isinstance(arg, sympy.Number):
+                return math.log(float(arg))
+        elif expr.func == sympy.Pow:
+            if not isinstance(arg, sympy.Symbol) or not arg.name.startswith(
+                ("output_split_", "reduction_split_")
+            ):
+                return expr
+            if expr.exp == 0.25:
+                # quadratic polyfit for i**0.25 for i ∈ [1, 32]
+                # maximum 3.5% error
+                return -0.00125916 * expr.base**2 + 0.07840521 * expr.base + 1.08405439
+            if expr.exp == -1:
+                return (
+                    sympy.Symbol(f"inv_{arg.name}", integer=True, nonnegative=True)
+                    / _CORE_INV_SCALE
+                )
+        return expr
 
     @staticmethod
-    def _min_expand(expr):
+    def _min_piecewise_expand(expr):
         # re-writes 2.1*Min(x, y) as Min(2.1*x, 2.1*y)
-        if len(expr.args) != 2 or not isinstance(expr.args[0], sympy.Number):
+        if len(expr.args) < 2 or not isinstance(expr.args[0], sympy.Number):
             return expr
-        arg = expr.args[1]
-        if not isinstance(arg, (sympy.Min, sympy.Max)):
-            return expr
-        m = expr.args[0]
-        new_args = [a * abs(m) for a in arg.args]
-        new_args = [
-            a.replace(
-                lambda e: e.func == sympy.Mul,
-                lambda e: _SympyExprToCpSat._min_expand(e),
+        if any(
+            isinstance(arg, (sympy.Min, sympy.Max, sympy.Piecewise))
+            for arg in expr.args[1:]
+        ):
+            idx, arg = next(
+                (
+                    (idx, a)
+                    for idx, a in enumerate(expr.args)
+                    if isinstance(a, (sympy.Min, sympy.Max, sympy.Piecewise))
+                )
             )
-            for a in new_args
-        ]
-        return arg.func(*new_args) * sympy.sign(m)
+            m = expr.args[0]
+
+            def apply(arg):
+                if isinstance(arg, (tuple, sympy.Tuple)):
+                    return (apply(arg[0]), *arg[1:])
+                else:
+                    new_arg = arg * abs(m)
+                    return new_arg.replace(
+                        lambda e: e.func == sympy.Mul,
+                        lambda e: _SympyExprToCpSat._min_piecewise_expand(e),
+                    )
+
+            new_args = [apply(a) for a in arg.args]
+            return (
+                arg.func(*new_args)
+                * sympy.sign(m)
+                * sympy.Mul(*(expr.args[1:idx] + expr.args[idx + 1 :]))
+            )
+        return expr
 
     @staticmethod
     def _truncate_floats_min(expr):
         # re-writes Min(x*0.5, y*0.5) as Min(x, y)/2
         m = 10000
-        result = []
         func = expr.func
 
-        def _process(expr):
+        def _process_inner(expr):
             if isinstance(expr, sympy.Mul) and isinstance(expr.args[0], sympy.Number):
                 a = (expr.args[0] * m).round()
                 r = sympy.Mul(a, *expr.args[1:])
@@ -519,11 +527,15 @@ class _SympyExprToCpSat(Printer):
                 r = expr * m
             return r
 
-        for arg in expr.args:
-            if isinstance(arg, sympy.Add):
-                result.append(sympy.Add(*[_process(a) for a in arg.args]))
+        def _process_outer(expr):
+            if isinstance(expr, sympy.Add):
+                return sympy.Add(*[_process_inner(a) for a in expr.args])
+            elif isinstance(expr, sympy.Tuple):
+                return (_process_outer(expr[0]), *expr[1:])
             else:
-                result.append(_process(arg))
+                return _process_inner(expr)
+
+        result = list(map(_process_outer, expr.args))
 
         return func(*result) / m
 
@@ -538,23 +550,60 @@ class _SympyExprToCpSat(Printer):
 
     def _print_Mul(self, expr):
         args = [self._print(arg) for arg in expr.args]
-        ints = [arg for arg in args if isinstance(arg, cp_model.IntVar)]
-        if len(ints) <= 1:
-            return math.prod(args)
+        return self._print_multiply(args)
 
+    def _print_multiply_two(self, a, b):
+        if isinstance(a, (int, float)) or isinstance(b, (int, float)):
+            return a * b
+        if isinstance(a, cp_model.IntVar) and isinstance(b, cp_model.IntVar):
+            return self._print_multiply([a, b])
+        if isinstance(a, (cp_model_helper.IntAffine, cp_model_helper.FloatAffine)):
+            return (
+                a.coefficient * self._print_multiply_two(a.expression, b) + a.offset * b
+            )
+        if isinstance(b, (cp_model_helper.IntAffine, cp_model_helper.FloatAffine)):
+            return self._print_multiply_two(b, a)
+        if hasattr(a, "num_exprs"):
+            try:
+                flat = cp_model.FlatIntExpr(a)
+            except TypeError:
+                flat = cp_model.FlatFloatExpr(a)
+            result = flat.offset * b
+            for var, c in zip(flat.vars, flat.coeffs):
+                result = result + c * self._print_multiply_two(var, b)
+            return result
+        if hasattr(b, "num_exprs"):
+            return self._print_multiply_two(b, a)
+        raise NotImplementedError(f"multiplying {type(a)} by {type(b)}")
+
+    def _print_multiply(self, args):
+        ints = [arg for arg in args if isinstance(arg, cp_model.IntVar)]
         nonints = [arg for arg in args if not isinstance(arg, cp_model.IntVar)]
+        if len(ints) == 1:
+            return self._print_multiply_two(math.prod(nonints), ints[0])
+        elif len(ints) == 0:
+            return math.prod(nonints)
+
         name = "_product_" + "_".join([arg.name for arg in ints])
         if name in self._sym_map:
-            return math.prod(nonints) * self._sym_map[name]
+            return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
 
-        lbs, ubs = list(zip(*[self._affine_bounds(arg) for arg in ints]))
-        assert all(lb >= 0 for lb in lbs)
-        assert all(ub >= 0 for ub in ubs)
-        lb, ub = map(math.prod, [lbs, ubs])
+        bounds = [self._affine_bounds(arg) for arg in ints]
+        # The product is multilinear (degree 1 in each factor), so its
+        # extrema over the box of bounds occur at the box's vertices. Rather
+        # than enumerating all 2**len(ints) vertices, fold the bounds
+        # pairwise: at each step the running [lb, ub] is the exact image of
+        # the partial product over its factors (a continuous function over a
+        # connected box), so it can be treated as one more independent
+        # interval factor and combined via standard interval multiplication.
+        (lb, ub), *rest = bounds
+        for a, b in rest:
+            candidates = (lb * a, lb * b, ub * a, ub * b)
+            lb, ub = min(candidates), max(candidates)
         product = self._model.new_int_var(int(lb), int(ub), name)
         self._model.AddMultiplicationEquality(product, ints)
         self._sym_map[name] = product
-        return math.prod(nonints) * product
+        return self._print_multiply_two(math.prod(nonints), product)
 
     def _print_Symbol(self, expr):
         if expr.name in self._sym_map:
@@ -580,19 +629,58 @@ class _SympyExprToCpSat(Printer):
         return cp_var
 
     def _print_Pow(self, expr):
+        if expr.exp == 2:
+            base = self._print(expr.base)
+            return self._print_multiply_two(base, base)
         return self._print(expr.base) ** self._print(expr.exp)
 
-    def _print_Piecewise(self, expr):
-        assert len(expr.args) == 2
-        assert expr.args[1] == (0, True)
-        assert expr.args[0][0] == 1
-        piecewise_var = self._model.new_bool_var(f"piecewise_{self._count}")
+    def _print_condition(self, cond):
+        if not isinstance(cond, sympy.core.relational.Relational):
+            return self._print(cond)
+        cond_expr = self._print(cond)
+        not_cond_expr = self._print(sympy.Not(cond))
+        var = self._model.new_bool_var(f"cond_{self._count}")
         self._count += 1
-        cond = self._print(expr.args[0][1])
-        not_cond = self._print(sympy.Not(expr.args[0][1]))
-        self._model.Add(cond).OnlyEnforceIf(piecewise_var)
-        self._model.Add(not_cond).OnlyEnforceIf(piecewise_var.Not())
-        return piecewise_var
+        self._model.Add(cond_expr).OnlyEnforceIf(var)
+        self._model.Add(not_cond_expr).OnlyEnforceIf(var.Not())
+        return var
+
+    def _print_And(self, expr):
+        lits = [self._print_condition(arg) for arg in expr.args]
+        and_var = self._model.new_bool_var(f"and_{self._count}")
+        self._count += 1
+        self._model.AddBoolAnd(lits).OnlyEnforceIf(and_var)
+        self._model.AddBoolOr([lit.Not() for lit in lits]).OnlyEnforceIf(and_var.Not())
+        return and_var
+
+    def _print_Or(self, expr):
+        lits = [self._print_condition(arg) for arg in expr.args]
+        or_var = self._model.new_bool_var(f"or_{self._count}")
+        self._count += 1
+        self._model.AddBoolOr(lits).OnlyEnforceIf(or_var)
+        self._model.AddBoolAnd([lit.Not() for lit in lits]).OnlyEnforceIf(or_var.Not())
+        return or_var
+
+    def _print_Piecewise(self, expr):
+        args = expr.args
+        assert args[-1][1] == sympy.true
+        result = 0
+        not_prev = []
+        for val, cond in args:
+            if cond == sympy.true:
+                lits = not_prev
+            else:
+                cond_var = self._print_condition(cond)
+                lits = [cond_var, *not_prev]
+                not_prev = [*not_prev, cond_var.Not()]
+            piecewise_var = self._model.new_bool_var(f"piecewise_{self._count}")
+            self._count += 1
+            self._model.AddBoolAnd(lits).OnlyEnforceIf(piecewise_var)
+            self._model.AddBoolOr([lit.Not() for lit in lits]).OnlyEnforceIf(
+                piecewise_var.Not()
+            )
+            result += self._print_multiply_two(piecewise_var, self._print(val))
+        return result
 
     def _print_Relational(self, expr):
         return _operator_map[expr.rel_op](*[self._print(arg) for arg in expr.args])
