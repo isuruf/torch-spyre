@@ -1442,10 +1442,6 @@ def _matmul_split_cost(
         return math.inf
 
     num_elems = B * M * N * K
-    is_symbolic = isinstance(cores_used, sympy.Basic) or isinstance(
-        num_elems, sympy.Basic
-    )
-
     # Compute: per-core MACs over peak, derated when the per-core M tile is too
     # short to fill the PT pipeline. The PT array streams M in passes of
     # _PT_ROWS; below _TARGET_PT_PASSES passes its startup/drain overhead is
@@ -1468,11 +1464,8 @@ def _matmul_split_cost(
         weight_batches = 1 if shared_weight else B
         bytes_total = (B * M * K + weight_batches * K * N + B * M * N) * _DTYPE_BYTES
         fanout_split = max(m, n) if shared_weight else n
-        # TODO: Remove special casing symbolic
-        cohort_penalty = (
-            1.0
-            if is_symbolic
-            else max(1.0, (fanout_split / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT)
+        cohort_penalty = max(
+            1.0, (fanout_split / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT
         )
         hbm_us = bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
     else:
