@@ -1379,8 +1379,7 @@ def piecewise(*args):
     """``piecewise``, symbolic-aware, mirroring the :func:`sympy.Piecewise`
     API: each argument is an ``(expr, cond)`` pair, evaluated in order.
     Dispatches to ``sympy.Piecewise`` when a condition is symbolic, otherwise
-    returns the ``expr`` of the first pair whose ``cond`` holds -- pass
-    ``True`` as the final condition for a default/otherwise branch."""
+    returns the evaluated value."""
     if any(isinstance(cond, sympy.Basic) for _expr, cond in args):
         return sympy.Piecewise(*args)
     for expr, cond in args:

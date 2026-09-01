@@ -317,6 +317,7 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         self.core_cost = m.new_int_var(0, max(core_cost), f"core_cost_{b.name}")
         # total cores this op uses under the chosen div
         self.cores = m.new_int_var(0, max(cores_used), f"occ_{b.name}")
+        self.cores_used = cores_used
 
         sym_core_divs = b.sym_core_divs
 
@@ -387,15 +388,30 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         self.buffer.chosen_division = solver.Value(self.division)
 
 
+_inv_rel_op = {
+    sympy.Eq: sympy.Eq,
+    sympy.Ge: sympy.Le,
+    sympy.Le: sympy.Ge,
+    sympy.Gt: sympy.Lt,
+    sympy.Lt: sympy.Gt,
+}
+
+
 class _SympyExprToCpSat(Printer):
     """Translates a sympy cost expression into an OR-Tools CP-SAT expression
     over an existing ``sympy symbol -> CP-SAT var`` mapping.
     """
 
-    def __init__(self, model: "cp_model.CpModel", sym_map: dict) -> None:
+    def __init__(
+        self,
+        model: "cp_model.CpModel",
+        sym_map: dict,
+        buffer_map: dict,
+    ) -> None:
         self._model = model
         self._count = 0
         self._sym_map = sym_map
+        self._buffer_map = buffer_map
         super().__init__()
 
     def convert(self, cost_expr: sympy.Expr) -> "cp_model.LinearExpr":
@@ -408,13 +424,13 @@ class _SympyExprToCpSat(Printer):
         )
         cost_expr = sympy.expand(cost_expr)
         cost_expr = cost_expr.replace(
-            lambda e: e.func == sympy.log,
-            lambda e: self._log_min(e),
+            lambda e: e.func in [sympy.log, sympy.Piecewise],
+            lambda e: self._piecewise_canonical(self._log_min(e)),
         )
         cost_expr = sympy.expand(cost_expr)
         cost_expr = cost_expr.replace(
-            lambda e: e.func in [sympy.log, sympy.Pow],
-            lambda e: self._inv_log_sym(e),
+            lambda e: e.func in [sympy.log, sympy.Pow, sympy.Mul],
+            self._inv_log_sym,
         )
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.Mul,
@@ -430,6 +446,8 @@ class _SympyExprToCpSat(Printer):
     @classmethod
     def _log_min(cls, expr):
         # rewrite log(min(a, b)) as min(log(a), log(b))
+        if expr.func is not sympy.log:
+            return expr
         arg = expr.args[0]
         if isinstance(arg, (sympy.Min, sympy.Max)):
             # n() here is to get a numeric value instead of log(2)
@@ -446,23 +464,26 @@ class _SympyExprToCpSat(Printer):
         else:
             return expr
 
-    @classmethod
-    def _inv_log_sym(cls, expr):
+    @staticmethod
+    def _is_split_sym(expr):
+        return expr.is_Symbol and expr.name.startswith(
+            ("output_split_", "reduction_split_")
+        )
+
+    def _inv_log_sym(self, expr):
         # replaces log(sym) with log2_sym and 1/sym with inv_sym
         arg = expr.args[0]
         if expr.func == sympy.log:
-            if isinstance(arg, sympy.Symbol) and "_split_" in arg.name:
+            if self._is_split_sym(arg):
                 return (
                     sympy.Symbol(f"log2_{arg.name}", integer=True, nonnegative=True)
                     * sympy.log(2.0)
                     / _CORE_LOG_SCALE
                 )
-            elif isinstance(arg, sympy.Number):
+            elif arg.is_Number:
                 return math.log(float(arg))
         elif expr.func == sympy.Pow:
-            if not isinstance(arg, sympy.Symbol) or not arg.name.startswith(
-                ("output_split_", "reduction_split_")
-            ):
+            if not self._is_split_sym(arg):
                 return expr
             if expr.exp == 0.25:
                 # quadratic polyfit for i**0.25 for i ∈ [1, 32]
@@ -473,7 +494,65 @@ class _SympyExprToCpSat(Printer):
                     sympy.Symbol(f"inv_{arg.name}", integer=True, nonnegative=True)
                     / _CORE_INV_SCALE
                 )
+        elif expr.func == sympy.Mul:
+            symbols = [
+                arg
+                for arg in expr.args
+                if arg.is_Symbol and arg.name.startswith("inv_")
+            ]
+            if len(symbols) <= 2:
+                return expr
+            product = "_product_" + "_".join(
+                sorted([symbol.name[4:] for symbol in symbols])
+            )
+            if product in self._sym_map:
+                result = sympy.Symbol(f"inv_{product}", integer=True, nonnegative=True)
+                result *= _CORE_INV_SCALE ** (len(symbols) - 1)
+                result *= math.prod([arg for arg in expr.args if arg not in symbols])
+                return result
         return expr
+
+    @classmethod
+    def _piecewise_canonical(cls, expr):
+        # re-write 1/x < 1/5 as x > 5, then tighten to an equivalent integer
+        # bound (e.g. x < 4/3 as x <= 1) when x is integer-valued and the
+        # bound is numeric.
+        if not expr.is_Piecewise:
+            return expr
+        args = []
+        for value, cond in expr.args:
+            if (
+                cond.is_Relational
+                and cond.lhs.is_Pow
+                and cond.lhs.exp == -1
+                and cond.lhs.base.is_Symbol
+                and cond.lhs.base.is_nonnegative
+            ):
+                args.append(
+                    (
+                        value,
+                        cls._tighten_integer_bound(
+                            _inv_rel_op[cond.func], 1 / cond.lhs, 1 / cond.rhs
+                        ),
+                    )
+                )
+            else:
+                args.append((value, cond))
+        return expr.func(*args)
+
+    @staticmethod
+    def _tighten_integer_bound(rel_op, lhs, rhs):
+        if not (lhs.is_Symbol and lhs.is_integer and rhs.is_Number):
+            return rel_op(lhs, rhs)
+        if rel_op is sympy.Lt:
+            return sympy.Le(lhs, sympy.ceiling(rhs) - 1)
+        if rel_op is sympy.Gt:
+            return sympy.Ge(lhs, sympy.floor(rhs) + 1)
+        if rel_op is sympy.Le:
+            return sympy.Le(lhs, sympy.floor(rhs))
+        if rel_op is sympy.Ge:
+            return sympy.Ge(lhs, sympy.ceiling(rhs))
+        return rel_op(lhs, rhs)
 
     @staticmethod
     def _min_piecewise_expand(expr):
@@ -611,8 +690,7 @@ class _SympyExprToCpSat(Printer):
         if not expr.name.startswith(("log2_", "inv_")):
             raise NotImplementedError(f"not implemented. expr: {expr}")
         name = expr.name[5:] if expr.name.startswith("log2_") else expr.name[4:]
-        b = self._sym_map[f"_buffer_{name}"]
-        raw = self._sym_map[f"_raw_{name}"]
+        b, raw = self._buffer_map[name]
 
         if expr.name.startswith("log2_"):
             values = [int(round(_CORE_LOG_SCALE * math.log2(v))) for v in raw]
@@ -878,9 +956,12 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         cost_expr: sympy.Expr,
     ) -> Optional["cp_model.CpSolverStatus"]:
         sym_map = {}
+        buffer_map = {}
         for t in tensors.values():
             sym_map[t.buffer.sym_is_lx.name] = t.in_buffer
             sym_core_divs = t.buffer.sym_core_divs
+
+            product = []
             for splits, cp_splits, cp_splits_raw in zip(
                 sym_core_divs,
                 t.cp_core_divs,
@@ -889,11 +970,15 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 for key, symbol in splits.items():
                     assert isinstance(symbol, sympy.Symbol)
                     sym_map[symbol.name] = cp_splits[key]
-                    sym_map[f"_buffer_{symbol.name}"] = t
-                    sym_map[f"_raw_{symbol.name}"] = cp_splits_raw[key]
+                    buffer_map[symbol.name] = (t, cp_splits_raw[key])
+                    product.append(symbol.name)
+            product.sort()
+            symbol = sympy.Symbol("_product_" + "_".join(product))
+            sym_map[symbol.name] = t.cores
+            buffer_map[symbol.name] = (t, t.cores_used)
 
         try:
-            cp_cost = _SympyExprToCpSat(model, sym_map).convert(cost_expr)
+            cp_cost = _SympyExprToCpSat(model, sym_map, buffer_map).convert(cost_expr)
             if not isinstance(cp_cost, (int, float)):
                 # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution
