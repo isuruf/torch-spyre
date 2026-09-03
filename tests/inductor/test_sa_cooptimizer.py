@@ -1154,6 +1154,46 @@ class CostExprScoringTest(TestCase):
             solver._score_fn([2], frozenset()), utils.to_fixed_us(40 / 1000)
         )
 
+    def test_residency_and_multiple_core_division_symbols_combine(self):
+        # A single cost_expr mixing sym_is_lx with more than one sym_core_divs
+        # entry (two output-split keys and one reduction-split key) at once --
+        # the two tests above each isolate one symbol kind.
+        buf = CoreDivisionBuffer(
+            name="A",
+            size=1024,
+            uses=[0, 1],
+            first_use_is_read=False,
+            in_place_parents=[],
+            residency_reason=None,
+            core_divisions=[
+                CoreDivision(output_splits={0: 1, 1: 1}, reduction_splits={}),
+                CoreDivision(output_splits={0: 2, 1: 1}, reduction_splits={0: 1}),
+                CoreDivision(output_splits={0: 4, 1: 2}, reduction_splits={0: 2}),
+            ],
+            parents=[],
+            cd_parent_matches={},
+            boundary=BufferType.Intermediate,
+        )
+        solver = SaCoOptimizingSolver([buf], 1 << 30, 128)
+        out_syms, red_syms = buf.sym_core_divs
+        self.assertEqual(set(out_syms), {0, 1})
+        self.assertEqual(set(red_syms), {0})
+        cost_expr = (
+            out_syms[0] * 10
+            + out_syms[1] * 100
+            + red_syms[0] * 1000
+            + 5000 * (1 - buf.sym_is_lx)
+        )
+        solver.plan_layout_and_core_divisions(cost_expr)
+        self.assertEqual(
+            solver._score_fn([2], frozenset()),
+            utils.to_fixed_us((4 * 10 + 2 * 100 + 2 * 1000 + 5000) / 1000),
+        )
+        self.assertEqual(
+            solver._score_fn([2], frozenset({"A"})),
+            utils.to_fixed_us((4 * 10 + 2 * 100 + 2 * 1000) / 1000),
+        )
+
     def test_unrecognized_free_symbol_falls_back_to_memory_only(self):
         # A dynamic-shape symbol (or anything else the allocator's build could
         # have left in) that isn't one of these buffers' own symbols must not

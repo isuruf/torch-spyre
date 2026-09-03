@@ -27,7 +27,7 @@ this extraction.
 
 import math
 import os
-from typing import Mapping
+from typing import Mapping, Optional
 
 from torch._inductor.ir import ComputedBuffer
 
@@ -524,7 +524,7 @@ def _relayout_features(op, out_dims):
 
 
 def extract_op_features(
-    op, work_slices=None, is_lx: Mapping[str, bool] = {}
+    op, work_slices=None, is_lx: Optional[Mapping[str, bool]] = None
 ) -> OpFeatures:
     """Build OpFeatures for one ComputedBuffer op (best-effort).
 
@@ -537,6 +537,7 @@ def extract_op_features(
     every input read); a name absent from the map -- or an empty map -- falls
     back to the arg's committed layout.
     """
+    is_lx = is_lx or {}
     data = getattr(op, "data", None)
     is_reduction = getattr(data, "reduction_type", None) is not None
     loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
