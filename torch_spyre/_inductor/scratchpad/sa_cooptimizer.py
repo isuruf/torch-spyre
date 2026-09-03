@@ -183,7 +183,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         )
 
     def plan_layout_and_core_divisions(
-        self, cost_expr=None
+        self, cost_expr: Optional[sympy.Expr] = None
     ) -> list[CoreDivisionBuffer]:
         """Anneal the joint ``(pi, W)`` state and write ``chosen_division`` /
         ``address`` back to each buffer; populate ``spill_reasons``. Returns the
@@ -211,7 +211,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._write_back()
         return list(self._bufs)
 
-    def _build_score_fn(self, cost_expr):
+    def _build_score_fn(self, cost_expr: Optional[sympy.Expr]):
         """Compile ``cost_expr`` into a ``(chosen, resident) -> fixed-point ns``
         callable, or ``None`` if it can't be evaluated from only this solver's
         own buffers.
@@ -237,11 +237,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                     buf.core_divisions[chosen[idx]].reduction_splits.get(key, 1)
                 )
         try:
-            expr = sympy.sympify(cost_expr)
-            free = sorted(expr.free_symbols, key=str)
+            free = sorted(cost_expr.free_symbols, key=str)
             if any(sym not in value_of for sym in free):
                 return None
-            fn = sympy.lambdify(free, expr, modules="math")
+            fn = sympy.lambdify(free, cost_expr, modules="math")
         except (ValueError, TypeError, ZeroDivisionError, RuntimeError):
             return None
 
