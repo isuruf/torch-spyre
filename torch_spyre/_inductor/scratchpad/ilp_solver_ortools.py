@@ -315,8 +315,7 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         self.division = m.new_int_var(0, len(b.core_divisions) - 1, f"div_{b.name}")
         self.eff_size = m.new_int_var(0, max(per_core), f"eff_size_{b.name}")
         self.core_cost = m.new_int_var(0, max(core_cost), f"core_cost_{b.name}")
-        # total cores this op uses under the chosen div
-        self.cores = m.new_int_var(0, max(cores_used), f"occ_{b.name}")
+        self.cores = m.new_int_var(min(cores_used), max(cores_used), f"occ_{b.name}")
         self.cores_used = cores_used
 
         sym_core_divs = b.sym_core_divs
