@@ -487,24 +487,18 @@ class _SympyExprToCpSat(Printer):
                 return expr
             if expr.exp == 0.25:
                 # Discrete piecewise linear approximation of x^(1/4) over the interval [1, 32],
-                # pinned to return 1 at x=1, generated using
-                # $TORCH_SPYRE/tools/approximate-power.py. Max 0.67% deviation for four segments;
+                # pinned to return 1 at x=1, generated using tools/approximate-power.py.
+                # since we check that the base is a _split_ symbol, it is an integer in the
+                # range [1, 32]
+                # Max 4.5% deviation for two segments;
                 # we would get:
                 #   max 1.6% deviation with 3 segments;
                 #   max 0.074% deviation with 8 segments;
                 #   max 0.019% deviation with 12 segments;
                 #   no deviation with 16 segments.
-                # We return NaN outside the interval of definition, so that we're likely to notice
-                # when the result is used inappropriately. The piecewise expression is also not
-                # expected to be evaluated at non-integer values, but we can't guard against that
-                # as easily.
                 return sympy.Piecewise(
-                    (math.nan, arg < 1),
-                    (0.189207115002721 * arg + 0.810792884997279, arg <= 2),
-                    (0.0834513045097036 * arg + 1.07281997200638, arg <= 6),
-                    (0.0442125945895629 * arg + 1.32622285287632, arg <= 14),
-                    (0.0243044730791246 * arg + 1.61661596519179, arg <= 32),
-                    (math.nan, True),
+                    (0.139980295504224*x + 0.860019704495776, x <= 5),
+                    (0.0287191888771944*x + 1.45940018593522, True)
                 )
             if expr.exp == -1:
                 return (
