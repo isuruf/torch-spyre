@@ -58,6 +58,8 @@ from functools import cached_property
 import numpy as np
 
 
+# ruff: noqa: E731
+
 # ---------------------------------------------------------------------------
 # continuous internals
 # ---------------------------------------------------------------------------
@@ -82,8 +84,7 @@ def _cont_tools(r):
         if a0 > 0.0 and s > 0.0:
             xstar = r * a0 / ((1.0 - r) * s)
             if 1.0 < xstar < t:
-                best = min(best, (1.0 - r) * np.log(a0)
-                           + r * np.log(s) - np.log(C))
+                best = min(best, (1.0 - r) * np.log(a0) + r * np.log(s) - np.log(C))
         return best
 
     def seg_ratio(E, lam_u, lam_v):
@@ -145,7 +146,7 @@ def _solve_cont(r, N, a, b, pin_left, pin_right, iters=300):
         return tot
 
     lo, hi = 0.0, 1.0
-    while log_span(hi) < logR:               # span grows with E
+    while log_span(hi) < logR:  # span grows with E
         hi *= 2.0
         if hi > 500.0:
             raise RuntimeError("failed to bracket E")
@@ -284,12 +285,12 @@ def _int_tools(r):
             # error is itself only good to ~1e-16, so a purely relative
             # test would reject exact 2-point fits.  Genuine violations
             # are orders of magnitude larger, not marginal.
-            return cand if _block_err(r, c, s, i, j) <= E * (1 + 1e-9) + 1e-14 \
-                else None
+            return cand if _block_err(r, c, s, i, j) <= E * (1 + 1e-9) + 1e-14 else None
+
         if i == j:
             return (gi, 0.0, i, gi)
 
-        if pin_l and pin_r:                    # two points fix the line
+        if pin_l and pin_r:  # two points fix the line
             s = (gj - gi) / (j - i)
             c = gi - s * i
             return ok((c, s, i, gi))
@@ -304,15 +305,15 @@ def _int_tools(r):
             # the box.
             if pin_l:
                 p, gp_ = i, gi
-                lof = lambda k: (el * gp(k) - gp_) / (k - p)   # unimodal max
-                upf = lambda k: (eu * gp(k) - gp_) / (k - p)   # unimodal max
+                lof = lambda k: (el * gp(k) - gp_) / (k - p)  # unimodal max
+                upf = lambda k: (eu * gp(k) - gp_) / (k - p)  # unimodal max
                 klo, khi = i + 1, j
                 s_lo = far_max(gp_, p, klo, khi, el)
                 s_hi = min(upf(klo), upf(khi))
             else:
                 p, gp_ = j, gj
-                lof = lambda k: (gp_ - eu * gp(k)) / (p - k)   # unimodal min
-                upf = lambda k: (gp_ - el * gp(k)) / (p - k)   # unimodal min
+                lof = lambda k: (gp_ - eu * gp(k)) / (p - k)  # unimodal min
+                upf = lambda k: (gp_ - el * gp(k)) / (p - k)  # unimodal min
                 klo, khi = i, j - 1
                 s_lo = max(lof(klo), lof(khi))
                 s_hi = near_min(gp_, p, klo, khi, el)
@@ -348,6 +349,7 @@ def _block_err(r, c, s, i, j):
     x* = r*c/((1-r)*s), so the maximum is at an endpoint and the minimum at
     an integer neighbouring x*.
     """
+
     def lr(k):
         v = c + s * k
         return -math.inf if v <= 0.0 else math.log(v) - r * math.log(k)
@@ -364,6 +366,7 @@ def _block_err(r, c, s, i, j):
 def _refine_intercept(line, dps=40):
     """Re-form c = yp - s*p at extended precision, then round once."""
     import mpmath as mp
+
     c, s, p, yp = line
     with mp.workdps(dps):
         return float(mp.mpf(yp) - mp.mpf(s) * mp.mpf(p)), s
@@ -407,8 +410,10 @@ def _solve_int(r, N, a, b, pin_left, pin_right, iters=200, E_hi=None):
             if limit < 1 or block_line(cur, cur + 1, E, pl, False) is None:
                 return None
             step = 1
-            while 2 * step <= limit and \
-                    block_line(cur, cur + 2 * step, E, pl, False) is not None:
+            while (
+                2 * step <= limit
+                and block_line(cur, cur + 2 * step, E, pl, False) is not None
+            ):
                 step *= 2
             lo, hi = step, min(2 * step, limit)
             while lo < hi:
@@ -421,14 +426,14 @@ def _solve_int(r, N, a, b, pin_left, pin_right, iters=200, E_hi=None):
             cur += lo + 1
 
     if E_hi is None:
-        E_hi = math.log(1.0 + 1.0)          # a very loose start
+        E_hi = math.log(1.0 + 1.0)  # a very loose start
         while cover(E_hi) is None:
             E_hi *= 2.0
             if E_hi > 700.0:
                 raise RuntimeError("no feasible E found")
     lo, hi = 0.0, E_hi
     if cover(lo) is not None:
-        hi = 0.0                            # M <= 2N: exact fit
+        hi = 0.0  # M <= 2N: exact fit
     else:
         for _ in range(iters):
             mid = 0.5 * (lo + hi)
@@ -481,10 +486,10 @@ class Fit:
     r: float
     E: float
     integer: bool
-    bounds: tuple                  # per segment, (lo, hi)
-    coeffs: tuple                  # per segment, (c, s)
-    knots: tuple = None            # continuous only, length N+1
-    values: tuple = None           # continuous only, length N+1
+    bounds: tuple  # per segment, (lo, hi)
+    coeffs: tuple  # per segment, (c, s)
+    knots: tuple = None  # continuous only, length N+1
+    values: tuple = None  # continuous only, length N+1
 
     @property
     def n_segments(self):
@@ -526,12 +531,12 @@ class Fit:
                 peaks.append(math.log(c + s * xv) - self.r * math.log(xv))
             if c > 0.0 and s > 0.0:
                 xstar = self.r * c / ((1.0 - self.r) * s)
-                cands = ([math.floor(xstar), math.ceil(xstar)]
-                         if self.integer else [xstar])
+                cands = (
+                    [math.floor(xstar), math.ceil(xstar)] if self.integer else [xstar]
+                )
                 for xv in cands:
                     if lo <= xv <= hi:
-                        dips.append(math.log(c + s * xv)
-                                    - self.r * math.log(xv))
+                        dips.append(math.log(c + s * xv) - self.r * math.log(xv))
         sup = max(max(abs(v) for v in peaks), max(abs(v) for v in dips))
         return sup, peaks, dips
 
@@ -566,8 +571,11 @@ class Fit:
         if outside not in ("nan", "clamp", "extend"):
             raise ValueError("outside must be 'nan', 'clamp' or 'extend'")
         if x is None:
-            x = sp.Symbol("x", integer=True) if self.integer \
+            x = (
+                sp.Symbol("x", integer=True)
+                if self.integer
                 else sp.Symbol("x", real=True)
+            )
 
         F = sp.Float
         n = self.n_segments
@@ -577,8 +585,9 @@ class Fit:
         if self.integer:
             cut = [x <= self.bounds[k][1] for k in range(n)]
         else:
-            cut = [x < self.bounds[k][1] for k in range(n - 1)] \
-                + [x <= self.bounds[-1][1]]
+            cut = [x < self.bounds[k][1] for k in range(n - 1)] + [
+                x <= self.bounds[-1][1]
+            ]
 
         pieces = []
         if outside == "extend":
@@ -596,8 +605,7 @@ class Fit:
         return sp.Piecewise(*pieces)
 
 
-def minimax_ratio_pwl(r, N, a, b, pin_left=True, pin_right=True,
-                      integer=False):
+def minimax_ratio_pwl(r, N, a, b, pin_left=True, pin_right=True, integer=False):
     """
     Solve with at most N segments and return a Fit.
 
@@ -617,19 +625,37 @@ def minimax_ratio_pwl(r, N, a, b, pin_left=True, pin_right=True,
     """
     if integer:
         blocks, coeffs, E = _solve_int(r, N, a, b, pin_left, pin_right)
-        return Fit(r=float(r), E=float(E), integer=True,
-                   bounds=tuple((int(i), int(j)) for i, j in blocks),
-                   coeffs=tuple((float(c), float(s)) for c, s in coeffs))
+        return Fit(
+            r=float(r),
+            E=float(E),
+            integer=True,
+            bounds=tuple((int(i), int(j)) for i, j in blocks),
+            coeffs=tuple((float(c), float(s)) for c, s in coeffs),
+        )
 
     xs, ys, E = _solve_cont(r, N, a, b, pin_left, pin_right)
-    return Fit(r=float(r), E=float(E), integer=False,
-               bounds=tuple(zip(map(float, xs[:-1]), map(float, xs[1:]))),
-               coeffs=_cont_coeffs(xs, ys),
-               knots=tuple(map(float, xs)), values=tuple(map(float, ys)))
+    return Fit(
+        r=float(r),
+        E=float(E),
+        integer=False,
+        bounds=tuple(zip(map(float, xs[:-1]), map(float, xs[1:]))),
+        coeffs=_cont_coeffs(xs, ys),
+        knots=tuple(map(float, xs)),
+        values=tuple(map(float, ys)),
+    )
 
 
-def segments_for_tolerance(r, tol, a, b, pin_left=True, pin_right=True,
-                           integer=False, relative="log", nmax=100000):
+def segments_for_tolerance(
+    r,
+    tol,
+    a,
+    b,
+    pin_left=True,
+    pin_right=True,
+    integer=False,
+    relative="log",
+    nmax=100000,
+):
     """
     Smallest N meeting a tolerance.  relative='log' reads tol as a bound on
     |log(p/g)|; 'band' reads it as a bound on |p/g - 1|.
@@ -639,8 +665,7 @@ def segments_for_tolerance(r, tol, a, b, pin_left=True, pin_right=True,
     target = tol if relative == "log" else math.log1p(tol)
     n = max(1, int(pin_left) + int(pin_right))
     while n <= nmax:
-        if minimax_ratio_pwl(r, n, a, b, pin_left, pin_right,
-                             integer).E <= target:
+        if minimax_ratio_pwl(r, n, a, b, pin_left, pin_right, integer).E <= target:
             return n
         n += 1
     raise RuntimeError("tolerance not reachable within nmax")
@@ -668,8 +693,9 @@ def _cont_coeffs(xs, ys):
         for x0, x1, y0, y1 in zip(xs[:-1], xs[1:], ys[:-1], ys[1:]):
             X0, X1 = mp.mpf(float(x0)), mp.mpf(float(x1))
             Y0, Y1 = mp.mpf(float(y0)), mp.mpf(float(y1))
-            out.append((float((Y0 * X1 - Y1 * X0) / (X1 - X0)),
-                        float((Y1 - Y0) / (X1 - X0))))
+            out.append(
+                (float((Y0 * X1 - Y1 * X0) / (X1 - X0)), float((Y1 - Y0) / (X1 - X0)))
+            )
     return tuple(out)
 
 
@@ -716,16 +742,13 @@ if __name__ == "__main__":
     import sympy as sp
 
     r, a, b = 0.4, 3.0, 4096.0
-    print(f"g(x) = x**{r} on [{a}, {b}]   "
-          f"({math.log10(b / a):.2f} decades)\n")
-    print(f"{'N':>3} {'continuous':>12} {'unpinned':>12} {'integer':>12}"
-          f" {'band':>9}")
+    print(f"g(x) = x**{r} on [{a}, {b}]   ({math.log10(b / a):.2f} decades)\n")
+    print(f"{'N':>3} {'continuous':>12} {'unpinned':>12} {'integer':>12} {'band':>9}")
     for N in (2, 4, 8, 16, 32):
         Ec = minimax_ratio_pwl(r, N, a, b).E
         Ef = minimax_ratio_pwl(r, N, a, b, False, False).E
         Ei = minimax_ratio_pwl(r, N, a, b, integer=True).E
-        print(f"{N:>3} {Ec:>12.5e} {Ef:>12.5e} {Ei:>12.5e}"
-              f" {math.expm1(Ec):>8.3%}")
+        print(f"{N:>3} {Ec:>12.5e} {Ef:>12.5e} {Ei:>12.5e} {math.expm1(Ec):>8.3%}")
 
     n = segments_for_tolerance(r, 1e-3, a, b, relative="band")
     ni = segments_for_tolerance(r, 1e-3, a, b, integer=True, relative="band")
@@ -735,8 +758,10 @@ if __name__ == "__main__":
     for hi in (8, 9, 13, 64):
         f = minimax_ratio_pwl(r, 4, 1, hi, integer=True)
         c = minimax_ratio_pwl(r, 4, 1.0, float(hi))
-        print(f"  [1, {hi}]  integer {f.E:.5e}   continuous {c.E:.5e}"
-              f"   gain {c.E / f.E if f.E > 1e-14 else float('inf'):>7.2f}")
+        print(
+            f"  [1, {hi}]  integer {f.E:.5e}   continuous {c.E:.5e}"
+            f"   gain {c.E / f.E if f.E > 1e-14 else float('inf'):>7.2f}"
+        )
 
     fit = minimax_ratio_pwl(r, 3, a, b)
     print("\ncontinuous, N=3 -- fit.piecewise:")
@@ -744,8 +769,10 @@ if __name__ == "__main__":
     sup, peaks, dips = fit.extrema()
     print(f"  E = {fit.E:.17g}   sup at exact extrema = {sup:.17g}")
     print(f"  dip spread = {max(dips) - min(dips):.2e}")
-    print(f"  fit(100.0) = {fit(100.0):.10f}   band = "
-          f"({fit.band[0]:.6f}, {fit.band[1]:.6f})")
+    print(
+        f"  fit(100.0) = {fit(100.0):.10f}   band = "
+        f"({fit.band[0]:.6f}, {fit.band[1]:.6f})"
+    )
 
     fit = minimax_ratio_pwl(r, 3, 1, 100, integer=True)
     print("\ninteger, N=3 on [1, 100] -- fit.piecewise:")

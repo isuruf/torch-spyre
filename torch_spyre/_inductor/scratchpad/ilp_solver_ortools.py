@@ -497,8 +497,8 @@ class _SympyExprToCpSat(Printer):
                 #   max 0.019% deviation with 12 segments;
                 #   no deviation with 16 segments.
                 return sympy.Piecewise(
-                    (0.139980295504224*x + 0.860019704495776, x <= 5),
-                    (0.0287191888771944*x + 1.45940018593522, True)
+                    (0.139980295504224 * arg + 0.860019704495776, arg <= 5),
+                    (0.0287191888771944 * arg + 1.45940018593522, True),
                 )
             if expr.exp == -1:
                 return (
