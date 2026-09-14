@@ -1301,7 +1301,8 @@ def _reduction_syms(
 
 def _core_division(op: Operation, splits: dict[sympy.Symbol, int]) -> CoreDivision:
     """Classify one symbol-keyed candidate for its producing operation."""
-    return CoreDivision(splits=splits, reduction_syms=_reduction_syms(op, splits))
+    sparse = {s: v for s, v in splits.items() if v > 1}
+    return CoreDivision(splits=sparse, reduction_syms=_reduction_syms(op, sparse))
 
 
 def _view_for_div(

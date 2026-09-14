@@ -193,14 +193,8 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
 
         n_paths = math.prod(len(b.core_divisions) for b in buffers_list)
 
-        def label(cd):
-            return ",".join(
-                f"s{s}/{f}"
-                for s, f in sorted(cd.splits.items(), key=lambda item: str(item[0]))
-            )
-
         winner = {
-            b.name: label(b.core_divisions[best_chosen[b.name]])
+            b.name: b.core_divisions[best_chosen[b.name]].label
             for b in variable_buffers
             if best_chosen[b.name] != 0
         }

@@ -1359,8 +1359,10 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             128,
             [0, 1],
             core_divisions=[
-                CoreDivision(output_splits={"b": 4, "m": 8}, reduction_splits={}),
-                CoreDivision(output_splits={"b": 4, "m": 4}, reduction_splits={"k": 2}),
+                CoreDivision(splits={"b": 4, "m": 8}),
+                CoreDivision(
+                    splits={"b": 4, "m": 4, "k": 2}, reduction_syms=frozenset({"k"})
+                ),
             ],
         )
         self.assertEqual(buf.core_divisions[0].cores_used, 32)

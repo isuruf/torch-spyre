@@ -217,12 +217,6 @@ class TileSpec:
         return math.prod(a.count for a in self.axes if not a.is_reduction)
 
     @property
-    def is_clean(self) -> bool:
-        """True when no reduction axis is tiled (mirrors
-        :attr:`CoreDivision.is_clean`)."""
-        return not any(a.is_reduction for a in self.axes)
-
-    @property
     def label(self) -> str:
         if not self.axes:
             return "untiled"
@@ -263,6 +257,21 @@ class CoreDivision:
     def output_partition(self) -> int:
         """How many cores the output buffer is sliced across."""
         return math.prod(self.output_splits.values())
+
+    @property
+    def label(self) -> str:
+        """Human-readable rendering of this division's splits, e.g.
+        ``"s0/4 ~s1/2"`` (output split by 4 on symbol 0, reduction split by 2
+        on symbol 1), or ``"whole"`` for the untouched, undivided candidate."""
+        out = ",".join(
+            f"s{s}/{f}"
+            for s, f in sorted(self.output_splits.items(), key=lambda i: str(i[0]))
+        )
+        red = ",".join(
+            f"~s{s}/{f}"
+            for s, f in sorted(self.reduction_splits.items(), key=lambda i: str(i[0]))
+        )
+        return " ".join(p for p in (out, red) if p) or "whole"
 
 
 @dataclass
