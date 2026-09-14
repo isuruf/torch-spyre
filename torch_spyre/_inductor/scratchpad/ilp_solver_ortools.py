@@ -455,9 +455,7 @@ class _SympyExprToCpSat(Printer):
 
     @staticmethod
     def _is_split_sym(expr):
-        return expr.is_Symbol and expr.name.startswith(
-            ("output_split_", "reduction_split_")
-        )
+        return expr.is_Symbol and expr.name.startswith("split_")
 
     def _inv_log_sym(self, expr):
         # replaces log(sym) with log2_sym and 1/sym with inv_sym
