@@ -2439,14 +2439,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         return matches
 
     @staticmethod
-    def _views_for_divs(op, dep, buf_name, divs, prep_cache: dict):
+    def _views_for_divs(op, dep, buf_name, divs: list[CoreDivision], prep_cache: dict):
         """Per-core views of ``buf_name`` for each candidate division of ``op``.
 
         The candidate-invariant prep is computed once and shared through
         ``prep_cache``, so cost scales with the op rather than its candidate
         count.
         """
-        return [_view_for_div(op, dep, buf_name, cd, prep_cache) for cd in divs]
+        return [_view_for_div(op, dep, buf_name, cd.splits, prep_cache) for cd in divs]
 
 
 def _make_cpsat_solver(
