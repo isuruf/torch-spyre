@@ -1466,8 +1466,10 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         self.view_wide = _physical_view((0, 2), (1, 2))
 
         def _div(splits, reduction=None):
+            output = dict(splits)
+            reduction = dict(reduction or {})
             return CoreDivision(
-                output_splits=dict(splits), reduction_splits=dict(reduction or {})
+                splits={**output, **reduction}, reduction_syms=frozenset(reduction)
             )
 
         # Consumer: a 4-core slicing, a 2-core one, an 8-core one that slices
@@ -1745,9 +1747,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
         ):
             divisions = allocator._division_map(graph)[op.name]
 
-        self.assertEqual(
-            divisions, [CoreDivision(output_splits={m: 8}, reduction_splits={})]
-        )
+        self.assertEqual(divisions, [CoreDivision(splits={m: 8})])
         self.assertEqual(is_legal.call_args_list[0].args[1], safe)
         self.assertEqual(is_legal.call_args_list[1].args[1], unsafe)
 
@@ -1757,9 +1757,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 name=op.name,
                 size=128,
                 uses=[0],
-                core_divisions=[
-                    CoreDivision(output_splits={batch: 4}, reduction_splits={})
-                ],
+                core_divisions=[CoreDivision(splits={batch: 4})],
                 chosen_division=0,
             )
         ]
@@ -1785,7 +1783,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
         rw.reads = []
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
 
-        fixed = CoreDivision(output_splits={1: 2}, reduction_splits={})
+        fixed = CoreDivision(splits={1: 2})
         with (
             patch(
                 "torch_spyre._inductor.scratchpad.allocator.op_read_writes",

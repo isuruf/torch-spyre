@@ -8640,7 +8640,7 @@ class TestTileSpecRepresentation(unittest.TestCase):
         self.assertEqual(r.label, "d0:4/~d2:3")
 
     def test_core_division_tiling_defaults_untiled_and_inert(self):
-        cd = CoreDivision(output_splits={0: 2})
+        cd = CoreDivision(splits={0: 2})
         self.assertEqual(cd.tiling, TileSpec())
         self.assertTrue(cd.tiling.is_untiled)
         # Distinct CoreDivisions do not share one mutable default.
@@ -8651,7 +8651,7 @@ class TestTileSpecRepresentation(unittest.TestCase):
             name="x",
             size=1024,
             uses=[0, 1],
-            core_divisions=[CoreDivision(output_splits={0: 2})],
+            core_divisions=[CoreDivision(splits={0: 2})],
         )
         self.assertEqual(buf.min_footprint, ceil_div(1024, 2))
 
@@ -8661,7 +8661,7 @@ class TestTileSpecRepresentation(unittest.TestCase):
             name="y",
             size=1024,
             uses=[0, 1],
-            core_divisions=[CoreDivision(output_splits={0: 2}, tiling=spec)],
+            core_divisions=[CoreDivision(splits={0: 2}, tiling=spec)],
         )
         self.assertEqual(buf.min_footprint, ceil_div(1024, 2 * spec.output_tile_count))
 
@@ -8672,7 +8672,7 @@ class TestTileSpecRepresentation(unittest.TestCase):
             name="z",
             size=1024,
             uses=[0, 1],
-            core_divisions=[CoreDivision(output_splits={0: 2}, tiling=spec)],
+            core_divisions=[CoreDivision(splits={0: 2}, tiling=spec)],
         )
         self.assertEqual(buf.min_footprint, ceil_div(1024, 2 * spec.output_tile_count))
 

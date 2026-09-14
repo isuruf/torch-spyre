@@ -1292,22 +1292,9 @@ def _core_division(op: Operation, splits: dict[sympy.Symbol, int]) -> CoreDivisi
     rw = op_read_writes(op)
     write = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
     if write is None:
-        return CoreDivision()
-    output = {
-        s: int(v) for s, v in splits.items() if write.index.coeff(s) != 0 and v > 1
-    }
-    reduction = {
-        s: int(v) for s, v in splits.items() if write.index.coeff(s) == 0 and v > 1
-    }
-    return CoreDivision(output_splits=output, reduction_splits=reduction)
-
-
-def _division_splits(op: Operation, division: CoreDivision) -> dict[sympy.Symbol, int]:
-    """Restore a complete symbol-keyed split map from a sparse division."""
-    return {
-        sym: int(division.output_splits.get(sym, division.reduction_splits.get(sym, 1)))
-        for sym in iteration_space_from_op(op)
-    }
+        return CoreDivision(splits=splits)
+    reduction_syms = frozenset(s for s in splits if write.index.coeff(s) == 0)
+    return CoreDivision(splits=splits, reduction_syms=reduction_syms)
 
 
 def _view_for_div(
@@ -1329,7 +1316,7 @@ def _view_for_div(
     if key not in prep_cache:
         prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
     return _per_core_view_from_prep(
-        prep_cache[key], _division_splits(op, division), division.reduction_splits
+        prep_cache[key], division.splits, division.reduction_splits
     )
 
 
@@ -1498,7 +1485,7 @@ def _legal_fixed_division(
     """Return upstream division when it satisfies hard constraints."""
     division = fixed[0]
     if not isinstance(op, ComputedBuffer) or _split_option_is_legal(
-        op, _division_splits(op, division)
+        op, division.splits
     ):
         logger.debug("keep upstream division for %s: %s", op.name, reason)
         return fixed
@@ -1939,9 +1926,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         from torch_spyre._inductor.dump_cost_model import extract_op_features
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
-        sym_core_divs = buffers[output_name].sym_core_divs
         op = graph.get_buffer(output_name)
-        ws = _work_slices(op, CoreDivision(sym_core_divs[0], sym_core_divs[1]))
+        division = CoreDivision(splits=buffers[output_name].sym_core_divs)
+        ws = _work_slices(op, division)
         return extract_op_features(op, ws, is_lx)
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
@@ -2040,18 +2027,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         seen: set[tuple] = set()
         for candidate in candidates:
             division = _core_division(op, candidate)
-            key = (
-                tuple(
-                    sorted(
-                        division.output_splits.items(), key=lambda item: str(item[0])
-                    )
-                ),
-                tuple(
-                    sorted(
-                        division.reduction_splits.items(), key=lambda item: str(item[0])
-                    )
-                ),
-            )
+            key = tuple(sorted(division.splits.items(), key=lambda item: str(item[0])))
             if key not in seen:
                 seen.add(key)
                 cds.append(division)
@@ -2082,9 +2058,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if not hasattr(op, "iteration_space_ownership"):
                 continue
             cd = buf.core_divisions[buf.chosen_division]
-            if not _split_option_is_legal(op, _division_splits(op, cd)):
+            if not _split_option_is_legal(op, cd.splits):
                 raise Unsupported(f"{op.name}: chosen split violates hard domain.")
-            commit_iteration_space_ownership(op, _division_splits(op, cd))
+            commit_iteration_space_ownership(op, cd.splits)
 
     def _determine_in_place_division_invariant(
         self, graph: GraphLowering
@@ -2397,16 +2373,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 )
                 if k is None:
                     cd = consumer_divs[j]
-                    per_sym = _division_splits(consumer, cd)
+                    per_sym = cd.splits
                     k = len(clone_divs)
                     clone_divs.append(
                         CoreDivision(
-                            output_splits={
+                            splits={
                                 sym: split
                                 for sym, split in per_sym.items()
                                 if split > 1
-                            },
-                            reduction_splits={},
+                            }
                         )
                     )  # a clone op cannot have a reduction split
                     clone_views.append(view)
