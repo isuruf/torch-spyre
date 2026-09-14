@@ -14,6 +14,7 @@
 
 import functools
 import logging
+import math
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -1287,21 +1288,27 @@ def _lx_planning_size() -> int:
     return round_up_to_alignment(frontend_reservation, _LX_ALLOCATION_GRANULARITY_BYTES)
 
 
-def _core_division(op: Operation, splits: dict[sympy.Symbol, int]) -> CoreDivision:
-    """Classify one symbol-keyed candidate for its producing operation."""
+def _reduction_syms(
+    op: Operation, splits: dict[sympy.Symbol, int]
+) -> frozenset[sympy.Symbol]:
+    """Get reduction symbols for an operation."""
     rw = op_read_writes(op)
     write = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
     if write is None:
-        return CoreDivision(splits=splits)
-    reduction_syms = frozenset(s for s in splits if write.index.coeff(s) == 0)
-    return CoreDivision(splits=splits, reduction_syms=reduction_syms)
+        return frozenset()
+    return frozenset(s for s in splits if write.index.coeff(s) == 0)
+
+
+def _core_division(op: Operation, splits: dict[sympy.Symbol, int]) -> CoreDivision:
+    """Classify one symbol-keyed candidate for its producing operation."""
+    return CoreDivision(splits=splits, reduction_syms=_reduction_syms(op, splits))
 
 
 def _view_for_div(
     op: Operation,
     dep: MemoryDep,
     buf_name: str,
-    division: CoreDivision,
+    splits: dict[sympy.Symbol, int],
     prep_cache: dict,
 ):
     """One candidate division's per-core view of ``buf_name``.
@@ -1315,8 +1322,11 @@ def _view_for_div(
     key = (op.get_name(), dep, buf_name)
     if key not in prep_cache:
         prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
+    syms = _reduction_syms(op, splits)
     return _per_core_view_from_prep(
-        prep_cache[key], division.splits, division.reduction_splits
+        prep_cache[key],
+        splits,
+        {k: v for k, v in splits.items() if k in syms},
     )
 
 
@@ -1376,13 +1386,13 @@ class ResidencyEdge:
     parent_is_matmul: bool
     prep_cache: dict
 
-    def parent_view(self, division: CoreDivision) -> Optional[PerCoreView]:
+    def parent_view(self, splits: dict[sympy.Symbol, int]) -> Optional[PerCoreView]:
         """The producer's write-view under ``division``, or ``None`` when that
         candidate cannot host a readable residency: a partial-reduction write
         (output not final), an unrepresentable slicing, or a matmul output
         split across more than one device dim."""
         view, partial, repr_ok = _view_for_div(
-            self.parent_op, self.write_dep, self.buf_name, division, self.prep_cache
+            self.parent_op, self.write_dep, self.buf_name, splits, self.prep_cache
         )
         if not repr_ok or partial:
             return None
@@ -1390,34 +1400,23 @@ class ResidencyEdge:
             return None
         return view
 
-    def consumer_view(self, division: CoreDivision) -> Optional[PerCoreView]:
+    def consumer_view(self, splits: dict[sympy.Symbol, int]) -> Optional[PerCoreView]:
         """The consumer's read-view under ``division``, or ``None`` when its
         slicing of the buffer is unrepresentable -- we never pin on a slicing
         we cannot verify."""
         view, _partial, repr_ok = _view_for_div(
-            self.consumer_op, self.read_dep, self.buf_name, division, self.prep_cache
+            self.consumer_op, self.read_dep, self.buf_name, splits, self.prep_cache
         )
         return view if repr_ok else None
 
-    def compatible(
-        self, parent_division: CoreDivision, consumer_division: CoreDivision
-    ) -> bool:
-        """Whether the two candidates induce the same per-core slicing of the
-        buffer on the same total core count. Equal views alone are not enough:
-        a producer on N and a consumer on M > N cores can share a slicing while
-        the consumer's extra (broadcast-axis) cores hold no copy and would read
-        stale LX."""
-        if parent_division.cores_used != consumer_division.cores_used:
-            return False
-        parent_view = self.parent_view(parent_division)
-        return parent_view is not None and parent_view.same_partition(
-            self.consumer_view(consumer_division)
-        )
+    @staticmethod
+    def _cores_used(splits: dict[sympy.Symbol, int]):
+        return math.prod(splits.values())
 
     def match_pairs(
         self,
-        parent_divisions: Sequence[CoreDivision],
-        consumer_divisions: Sequence[CoreDivision],
+        parent_divisions: Sequence[dict[sympy.Symbol, int]],
+        consumer_divisions: Sequence[dict[sympy.Symbol, int]],
     ) -> list[tuple[int, int]]:
         """Compatible ``(parent index, consumer index)`` pairs, with each side's
         view computed once per candidate rather than once per pair."""
@@ -1430,7 +1429,8 @@ class ResidencyEdge:
             for j, consumer_view in enumerate(consumer_views)
             if consumer_view is not None
             and parent_view.same_partition(consumer_view)
-            and parent_divisions[i].cores_used == consumer_divisions[j].cores_used
+            and self._cores_used(parent_divisions[i])
+            == self._cores_used(consumer_divisions[j])
         ]
 
 
@@ -2431,7 +2431,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
             if edge is None:
                 continue
-            matches[parent] = edge.match_pairs(divisions[parent], consumer_divs)
+            matches[parent] = edge.match_pairs(
+                [cd.splits for cd in divisions[parent]],
+                [cd.splits for cd in consumer_divs],
+            )
         return matches
 
     @staticmethod
