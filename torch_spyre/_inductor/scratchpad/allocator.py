@@ -83,6 +83,9 @@ from torch_spyre._inductor.scratchpad.simulated_annealing import (
 from torch_spyre._inductor.scratchpad.exhaustive_search import (
     ExhaustiveSearchSolver,
 )
+from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+    CpSatLayoutSolver,
+)
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 from torch_spyre._inductor.scratchpad.utils import (
     round_up_to_alignment,
@@ -3544,38 +3547,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         return [_view_for_div(op, dep, buf_name, cd.splits, prep_cache) for cd in divs]
 
 
-def _make_cpsat_solver(
-    buffers: Sequence[LifetimeBoundBuffer], size: int
-) -> MemoryPlanSolver:
-    """Build the CP-SAT layout solver, or ``GreedyLayoutSolver`` when ortools
-    is unavailable.
-
-    Imported lazily so this module (and every non-cpsat path) loads without
-    ortools installed; ``CpSatLayoutSolver.__init__`` raises ``ImportError``
-    when ortools (``cp_model``) is missing, which we translate to a
-    placement-only greedy fallback so callers never see an unusable factory.
-    """
-    try:
-        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-            CpSatLayoutSolver,
-        )
-
-        return CpSatLayoutSolver(buffers, size)
-    except ImportError as exc:
-        logger.warning(
-            "cpsat layout solver unavailable (%s); falling back to the "
-            "default greedy allocator.",
-            exc,
-        )
-        return GreedyLayoutSolver(buffers, size)
-
-
 _PLACEMENT_SOLVERS: dict[str, LayoutSolverFactory] = {
     "greedy": GreedyLayoutSolver,
     "bestfit": BestFitLayoutSolver,
     "firstfit": FirstFitLayoutSolver,
     "simulated_annealing": SimulatedAnnealingLayoutSolver,
-    "cpsat": _make_cpsat_solver,
+    "cpsat": CpSatLayoutSolver,
 }
 
 
