@@ -361,6 +361,12 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
                 key: only.splits.get(key, 1) for key in b.sym_core_divs
             }
             self.cp_core_divs_raw = {key: [v] for key, v in self.cp_core_divs.items()}
+            self.cp_tile_counts = {
+                key: only.tiling.count_for(key) for key in b.sym_tile_counts
+            }
+            self.cp_tile_counts_raw = {
+                key: [v] for key, v in self.cp_tile_counts.items()
+            }
             true, false = m.new_constant(1), m.new_constant(0)
             self.division_is = lambda i: true if i == 0 else false
             return
@@ -381,6 +387,20 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
 
         self.cp_core_divs = cp_core_divs
         self.cp_core_divs_raw = cp_core_divs_raw
+
+        # The coarse-tiling counts, tied to the division index the same way:
+        # each candidate division carries its own tiling.
+        cp_tile_counts: dict = {}
+        cp_tile_counts_raw: dict = {}
+        for key, symbol in b.sym_tile_counts.items():
+            raw = [cd.tiling.count_for(key) for cd in b.core_divisions]
+            cp_var = m.new_int_var(min(raw), max(raw), symbol.name)
+            m.add_element(self.division, raw, cp_var)
+            cp_tile_counts[key] = cp_var
+            cp_tile_counts_raw[key] = raw
+
+        self.cp_tile_counts = cp_tile_counts
+        self.cp_tile_counts_raw = cp_tile_counts_raw
 
         # tie per-core footprint (output split only) and total core usage to the
         # chosen division index
@@ -643,7 +663,10 @@ class _SympyExprToCpSat(Printer):
 
     @staticmethod
     def _is_split_sym(expr):
-        return expr.is_Symbol and expr.name.startswith("split_")
+        # A tile count is, like a core split, a positive integer tabulated over
+        # its buffer's candidate divisions, so its log and inverse lower the
+        # same way.
+        return expr.is_Symbol and expr.name.startswith(("split_", "tile_"))
 
     def _inv_scale(self, name: str) -> int:
         """Fixed-point scale of ``inv_<name>``: the LCM of ``name``'s values
@@ -703,7 +726,8 @@ class _SympyExprToCpSat(Printer):
         elif expr.func == sympy.Pow:
             if not self._is_split_sym(arg):
                 return expr
-            if expr.exp == 0.25:
+            # Core splits only: a tile count can exceed 32.
+            if expr.exp == 0.25 and arg.name.startswith("split_"):
                 # Discrete piecewise linear approximation of x^(1/4) over the interval [1, 32],
                 # pinned to return 1 at x=1, generated using tools/approximate-power.py.
                 # since we check that the base is a _split_ symbol, it is an integer in the
@@ -1341,6 +1365,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             symbol = sympy.Symbol("_product_" + "_".join(product))
             sym_map[symbol.name] = t.cores
             buffer_map[symbol.name] = (t, t.cores_used)
+
+            for key, symbol in t.buffer.sym_tile_counts.items():
+                sym_map[symbol.name] = t.cp_tile_counts[key]
+                buffer_map[symbol.name] = (t, t.cp_tile_counts_raw[key])
 
         try:
             cp_cost = _SympyExprToCpSat(model, sym_map, buffer_map).convert(cost_expr)

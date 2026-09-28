@@ -2353,7 +2353,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # TypeError is in the set because a cost-model branch over an undecided
         # `is_lx`/`output_split` raises "cannot determine truth value of Relational"
         # rather than anything the model raises itself (issue #4233); every tiling
-        # surface that did so is now neutralised at `cost_model._tiled_rows`, so this
+        # surface that did so now skips a symbolic tile height in `cost_model`, so this
         # only has to keep a FUTURE symbolic-hostile branch from killing a compile.
         # Losing the expression costs the objective, not correctness -- but it costs it
         # in BOTH engines now that #4164 has the annealer consume cost_expr: CP-SAT falls
@@ -2461,15 +2461,25 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         decision variables. The extractor reads each arg's symbolic residency
         from ``is_lx`` (built once by the caller over all of ``buffers``, not
         per op); ``buffers`` itself supplies this op's own candidate divisions.
+
+        Candidate coarse tilings enter the same way: each tiled axis's
+        symbolic count (``sym_tile_counts``) is keyed on the op's own loop
+        variable for that axis. With no tiled candidate there are none, and the
+        extractor reads the op's committed tiling (``loop_info``) as before.
         """
         from torch_spyre._inductor.dump_cost_model import extract_op_features
+        from torch_spyre._inductor.scratchpad.coarse_tiling import tile_axis_loop_var
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
         op = graph.get_buffer(output_name) if op is None else op
         buffer = buffers[output_name]
         division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)
-        return extract_op_features(op, ws, is_lx=is_lx)
+        tiling: dict = {}
+        for (host_dim, is_reduction), symbol in buffer.sym_tile_counts.items():
+            var = tile_axis_loop_var(op, host_dim, is_reduction)
+            tiling[var] = tiling.get(var, 1) * symbol
+        return extract_op_features(op, ws, is_lx=is_lx, tiling=tiling or None)
 
     def _finalize_lx_relayout_allocation(
         self,
