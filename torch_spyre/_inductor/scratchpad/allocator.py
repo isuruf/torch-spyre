@@ -2476,9 +2476,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)
         tiling: dict = {}
-        for (host_dim, is_reduction), symbol in buffer.sym_tile_counts.items():
-            var = tile_axis_loop_var(op, host_dim, is_reduction)
-            tiling[var] = tiling.get(var, 1) * symbol
+        if config.unified_tiling:
+            for (host_dim, is_reduction), symbol in buffer.sym_tile_counts.items():
+                var = tile_axis_loop_var(op, host_dim, is_reduction)
+                tiling[var] = tiling.get(var, 1) * symbol
         return extract_op_features(op, ws, is_lx=is_lx, tiling=tiling or None)
 
     def _finalize_lx_relayout_allocation(
