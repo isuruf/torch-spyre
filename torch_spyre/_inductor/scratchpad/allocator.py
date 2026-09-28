@@ -146,6 +146,32 @@ _COST_PARAMS = CostParams(
     overlap_gamma=0.46,
     use_bundled_cost_model=False,
 )
+# The CP-SAT objective's variant. The tile height is a solver expression there,
+# and the coarse underfill and LX-spill derates raise it to fractional powers
+# CP-SAT cannot lower: with them on, the whole cost objective falls back to the
+# lexicographic one. Zero exponents drop the tile height from both
+# (``rpc**0 == 1``) and the 1.0 cap pins the underfill there, so each derate is
+# exactly 1. The annealer evaluates the objective numerically and keeps them.
+_CPSAT_COST_PARAMS = replace(
+    _COST_PARAMS,
+    coarse_underfill_exp=0.0,
+    coarse_underfill_col_exp=0.0,
+    coarse_underfill_cap=1.0,
+    lx_spill_exp=0.0,
+    mm_spill_ws_exp=0.0,
+)
+
+
+def _objective_cost_params(solver) -> CostParams:
+    """The cost parameters ``solver``'s objective is built with: the
+    linearizable :data:`_CPSAT_COST_PARAMS` for CP-SAT, else
+    :data:`_COST_PARAMS`."""
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
+
+    if isinstance(solver, CpSatLayoutSolver):
+        return _CPSAT_COST_PARAMS
+    return _COST_PARAMS
+
 
 logger = get_inductor_logger("scratchpad.allocator")
 
@@ -2365,10 +2391,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # Without that escape hatch a TypeError from ordinary drift, say a signature
         # change or a None in a term, is a silent objective loss no test can fail on.
         bundle_terms: list = []
+        cost_params = _objective_cost_params(solver)
         try:
-            bundle_terms = predict_bundles(
-                pricing_ops, op_features, params=_COST_PARAMS
-            )
+            bundle_terms = predict_bundles(pricing_ops, op_features, params=cost_params)
             cost_expr = sympy.sympify(sum(term for _, term in bundle_terms))
         except (ValueError, RuntimeError, TypeError) as e:
             logger.warning(
@@ -2446,7 +2471,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             emit_json_line(
                 config.dump_cost_expr_file,
                 cost_expr_record(
-                    cost_expr, bundle_terms, result, _COST_PARAMS, context=context
+                    cost_expr, bundle_terms, result, cost_params, context=context
                 ),
             )
         return result

@@ -1004,7 +1004,7 @@ def _select(flag, if_true, if_false):
     tiling, which may choose to leave every output axis untiled -- as a
     ``Piecewise`` then. Both engines lower it: CP-SAT as reified literals,
     ``lambdify`` directly."""
-    if isinstance(flag, sympy.Basic):
+    if isinstance(flag, sympy.Basic) and flag not in (sympy.true, sympy.false):
         return sympy.Piecewise((if_true, flag), (if_false, True))
     return if_true if flag else if_false
 
@@ -1065,7 +1065,11 @@ def coarse_underfill_eff(
     e0 = p.coarse_underfill_eff0
     # Branch-free, so a symbolic `rpc` does not need its comparison decided:
     # `raw >= e0` -> min(ceil_, raw); below -> min(ceil_, e0) * (raw/e0)**gamma.
-    return min(ceil_, max(raw, e0)) * min(1.0, raw / e0) ** p.coarse_underfill_gamma
+    return _select(
+        raw >= e0,
+        min(ceil_, raw),
+        _select(ceil_ >= e0, e0, ceil_) * (raw / e0) ** p.coarse_underfill_gamma,
+    )
 
 
 def coarse_underfill_eff_matmul(rpc: float, params: CostParams | None = None) -> float:
@@ -1116,7 +1120,9 @@ def _lx_spill_bw_derate(ops: list, params: CostParams | None = None) -> float:
         _cap, _exp = p.mm_spill_ws_cap_bytes, p.mm_spill_ws_exp
     # `max(ws, _cap)` rather than `min(1.0, (_cap / ws) ** _exp)`: the same
     # value, but no division by zero when nothing is output-tiled (ws == 0).
-    return (_cap / max(ws, _cap)) ** _exp
+    if ws == 0:
+        return 1.0
+    return _cap**_exp / max(ws**_exp, _cap**_exp)
 
 
 def _bmm_layout_pair(o) -> tuple:

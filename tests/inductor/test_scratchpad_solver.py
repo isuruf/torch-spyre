@@ -2159,6 +2159,53 @@ class TestInvScale(TestCase):
         self.assertEqual([v for v in raw if 864 % v], [7])
         self.assertEqual(self._max_error(raw, 864), self._max_error(raw, 288))
 
+    def test_tile_counts_past_the_core_count_keep_every_reciprocal(self):
+        # A tile count is any divisor of its axis, so it can pass the core
+        # count a _CORE_INV_SCALE-sized cap was sized for. 2048 used to trip
+        # the power-of-two assert; 1536 alone used to floor 1024 // v to 0.
+        for label, raw in {
+            "exact power of two": [1, 2048],
+            "power of two with a coprime": [1, 2048, 3, 7],
+            "no power of two past 1": [1, 1536],
+        }.items():
+            with self.subTest(label):
+                scale = self._scale(raw)
+                self.assertGreaterEqual(min(scale // v for v in raw), 1)
+                self.assertFalse([v for v in raw if not v & (v - 1) and scale % v])
+                self.assertLessEqual(self._max_error(raw, scale), self.MAX_ERROR)
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "the CP-SAT objective params need ortools")
+class TestObjectiveCostParams(TestCase):
+    """Only CP-SAT drops the tile-height derates it cannot linearize; the
+    annealer evaluates its objective numerically and keeps the calibrated ones."""
+
+    def test_cpsat_neutralizes_the_derates(self):
+        from torch_spyre._inductor.cost_model import coarse_underfill_eff
+        from torch_spyre._inductor.scratchpad.allocator import (
+            _COST_PARAMS,
+            _CPSAT_COST_PARAMS,
+            _objective_cost_params,
+        )
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
+            SaCoOptimizingSolver,
+        )
+
+        self.assertIs(
+            _objective_cost_params(CpSatLayoutSolver([], 1 << 20)),
+            _CPSAT_COST_PARAMS,
+        )
+        self.assertIs(
+            _objective_cost_params(SaCoOptimizingSolver([], 1 << 20)), _COST_PARAMS
+        )
+        # A symbolic tile height leaves no fractional power behind for CP-SAT.
+        is_lx, split = sympy.symbols("is_lx_buf0 split_buf0_d0", positive=True)
+        rpc = (256 * (1 - is_lx) + 1024 * is_lx) / split
+        eff = sympy.sympify(coarse_underfill_eff(rpc, 512, _CPSAT_COST_PARAMS))
+        self.assertFalse(eff.free_symbols)
+        self.assertEqual(float(eff), 1.0)
+        self.assertLess(coarse_underfill_eff(2.0, 512, _COST_PARAMS), 1)
+
 
 if __name__ == "__main__":
     import unittest

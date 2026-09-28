@@ -157,6 +157,9 @@ _CORE_LOG_SCALE = 32.0
 # the split has no candidate values (see _SympyExprToCpSat._inv_scale).
 # error <= ~4%
 _CORE_INV_SCALE = 1024
+# largest value _CORE_INV_SCALE is sized for: the core count. Past it (a tile
+# count can be any divisor of its axis) the cap grows in step, see _inv_scale.
+_CORE_INV_SCALE_MAX_VALUE = 32
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
 
@@ -672,14 +675,23 @@ class _SympyExprToCpSat(Printer):
         """Fixed-point scale of ``inv_<name>``: the LCM of ``name``'s values
         across the candidate divisions, so every ``scale // v`` is exact and the
         variable spans only the bits it needs. ``_CORE_INV_SCALE`` when there
-        are no values, or a value with many divisors if the LCM exceeds it."""
+        are no values, or a value with many divisors if the LCM exceeds the cap.
+
+        The cap is ``_CORE_INV_SCALE`` for values up to the core count and
+        doubles with each doubling past it, so a tile count, which can far
+        exceed any core split, keeps the resolution a split has rather than
+        flattening to ``scale // v == 0``."""
         _, raw = self._buffer_map.get(name, (None, ()))
         if not raw or min(raw) < 1:
             return _CORE_INV_SCALE
 
         ints = [int(r) for r in raw]
+        widen = max(
+            0, (max(ints) - 1).bit_length() - _CORE_INV_SCALE_MAX_VALUE.bit_length() + 1
+        )
+        cap = _CORE_INV_SCALE << widen
         lcm = math.lcm(*ints)
-        if lcm <= _CORE_INV_SCALE:
+        if lcm <= cap:
             return lcm
 
         # Otherwise: find the highest power of 2 in ints; among its multiples,
@@ -687,11 +699,9 @@ class _SympyExprToCpSat(Printer):
         # (We weight entries of ints by multiplicity.)
         cnt = Counter(ints)
         pow2 = max((a for a in cnt if a & (a - 1) == 0), default=1)
-        assert pow2 < _CORE_INV_SCALE, (
-            f"expected _CORE_INV_SCALE={_CORE_INV_SCALE} to be greater than any "
-            f"power of 2 that might occur as a core division, but found {pow2}"
-        )
-        scaled_core_inv_scale = _CORE_INV_SCALE // pow2
+        # The cap is sized past every value, so this holds by construction.
+        assert pow2 < cap, f"expected cap={cap} past every value, found {pow2}"
+        scaled_core_inv_scale = cap // pow2
         counts = np.zeros(scaled_core_inv_scale + 1, dtype=np.int64)
         for a, mult in cnt.items():
             step = a // math.gcd(a, pow2)

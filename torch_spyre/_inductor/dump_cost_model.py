@@ -38,6 +38,7 @@ from .cost_model import (
     ArgTraffic,
     OpFeatures,
     _matmul_axes_for_split_cost,
+    _select,
     explain,
     max,
 )
@@ -560,7 +561,7 @@ def _matmul_features(
     data = getattr(op, "data", None)
     k_size = _prod_ints(getattr(data, "reduction_ranges", None) or [])
     # Scale a reduction-tiled slice back up to the whole-loop total (see docstring).
-    macs = out_elems * k_size * (loop_trip if tiles_red_dim else 1)
+    macs = out_elems * k_size * _select(tiles_red_dim, loop_trip, 1)
     rows_per_core = cols_per_core = 0.0
     a_bytes = b_bytes = 0
     k_split = m_split = n_split = 1
@@ -1019,8 +1020,9 @@ def extract_op_features(
             op,
             out_elems,
             dtype_bytes,
-            loop_trip,
-            is_tiled_red,
+            # A candidate-tiled op is still untiled: its K is already the total.
+            1 if tiling else loop_trip,
+            False if tiling else is_tiled_red,
             work_slices,
         )
         reduction_cores = k_split
@@ -1058,7 +1060,7 @@ def extract_op_features(
         # diagnostic -- a ZeroDivisionError here would take down a compile for a number
         # nothing depends on. Guard locally rather than rely on the caller's condition.
         split = _row_split(op, cores, work_slices) or 1
-        tile_rows_per_core = sympy.Piecewise((rows / split, tiles_out_dim), (0.0, True))
+        tile_rows_per_core = _select(tiles_out_dim, rows / split, 0.0)
 
     # PER-ARG, PER-LEVEL loop factors. An operand is re-transferred at a nesting level
     # whose tiled symbol its index does NOT contain, and walked (transferred once) at a
@@ -1083,10 +1085,8 @@ def extract_op_features(
     if _levels and _write_index is not None:
         out_factor = _loop_factor_for_index(_write_index, _levels)
     else:  # no loop_info (or unreadable index) -> the pre-existing behaviour
-        out_factor = sympy.Piecewise((1, tiles_out_dim), (loop_trip, True))
-    in_factor = sympy.Piecewise(
-        (1, sympy.Or(tiles_out_dim, is_tiled_red)), (loop_trip, True)
-    )
+        out_factor = _select(tiles_out_dim, 1, loop_trip)
+    in_factor = _select(tiles_out_dim, 1, _select(is_tiled_red, 1, loop_trip))
 
     # Traffic of an indirect mutation's store (see _indirect_write_elems). Symbolic
     # residency is the chooser's form and must not block it: indirect buffers are
