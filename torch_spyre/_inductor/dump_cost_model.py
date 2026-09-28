@@ -386,6 +386,27 @@ def _candidate_tiling(op, tiling: Mapping):
     )
 
 
+def _tile_count(index, tiling: Optional[Mapping]):
+    """Tiles a candidate ``tiling`` cuts the buffer at ``index`` into: the
+    product of the counts on the loop variables the index carries (1 for none,
+    or with no candidate tiling)."""
+    if not tiling or index is None:
+        return 1
+    free = getattr(index, "free_symbols", None) or ()
+    return math.prod(count for sym, count in tiling.items() if sym in free)
+
+
+def _per_tile_elems(elems, is_lx, tiles):
+    """``elems`` as a candidate-tiled buffer reports them, matching a committed
+    tiling: an LX buffer is allocated per tile, an HBM buffer keeps its full
+    extent. ``is_lx`` and ``tiles`` may each be symbolic."""
+    if tiles == 1 or is_lx is False:
+        return elems
+    if is_lx is True:
+        return elems / tiles
+    return elems * (1 - is_lx) + elems / tiles * is_lx
+
+
 def _row_split(op, default: int, work_slices=None) -> int:
     """Core split of the ROW (partition) device dim = the output var with the largest
     write-index coefficient (the outer/row dim; the stick dim has the smallest). Used so
@@ -925,8 +946,9 @@ def extract_op_features(
     planning: loop variable -> trip count, concrete or the solver's symbols, as
     ``work_slices`` is for the core split (see :func:`_candidate_tiling`).
     Otherwise the op's committed ``loop_info`` supplies the tiling. The op's
-    sizes are then the whole loop's, not one tile's, so nothing is rescaled by
-    the trip count the way a committed reduction-tiled op's MACs are.
+    sizes are then the whole loop's, not one tile's, so each LX arg is cut to
+    its per-tile size, as a committed tiling allocates it; an HBM arg keeps
+    its full extent either way.
 
     Each arg is also stamped with ``is_boundary``: whether ITS traffic crosses the
     graph boundary, resolved against the arg's own role, so a buffer that is both a
@@ -997,9 +1019,8 @@ def extract_op_features(
             op,
             out_elems,
             dtype_bytes,
-            # A candidate-tiled op is still untiled: its K is already the total.
-            1 if tiling else loop_trip,
-            False if tiling else is_tiled_red,
+            loop_trip,
+            is_tiled_red,
             work_slices,
         )
         reduction_cores = k_split
@@ -1013,20 +1034,7 @@ def extract_op_features(
     # (rows/tile < col-sticks), leaving each core a full row tile (no underfill). 0.0 =
     # N/A -> no derate.
     tile_rows_per_core = 0.0
-    if tiling:
-        # The untiled op's rows are the whole loop's, whatever the output's
-        # residency, so the per-tile slice is rows / output tiles. Zero again for
-        # a candidate that leaves every output axis untiled.
-        if tiles_out_dim is not False and len(out_dims) >= 2:
-            rows = (out_size[-2] if len(out_size) >= 2 else 0) or out_dims[-2]
-            split = _row_split(op, cores, work_slices) or 1
-            rpc = rows / output_tiles / split
-            tile_rows_per_core = (
-                rpc
-                if tiles_out_dim is True
-                else sympy.Piecewise((rpc, tiles_out_dim), (0.0, True))
-            )
-    elif tiles_out_dim and loop_trip > 1 and len(out_dims) >= 2:
+    if len(out_dims) >= 2:
         # Row extent from the LOGICAL shape, not the device shape. ``out_dims[-2]`` is
         # the row count only for a rank-2 tensor, whose device layout is rank-3. A
         # rank-3 or rank-4 tensor has a rank-4/5 device layout in which [-2] is a
@@ -1041,13 +1049,16 @@ def extract_op_features(
         # same fix, as _matmul_features' batch-dim exclusion above.
         rows = (out_size[-2] if len(out_size) >= 2 else 0) or out_dims[-2]
         # full-buffer alloc: per-tile slice is rows / loop_trip
-        rows = rows / loop_trip * (1 - out_is_lx) + rows * out_is_lx
+        # A candidate-tiled op is still untiled, so its LX output's rows are also
+        # the whole loop's: the per-tile slice is rows / output tiles.
+        out_tiles = output_tiles if tiling else 1
+        rows = rows / loop_trip * (1 - out_is_lx) + rows / out_tiles * out_is_lx
         # `loop_trip > 1` is guaranteed by the branch condition; `_row_split` can in
         # principle return 0 if a split map ever records one, and this term is a
         # diagnostic -- a ZeroDivisionError here would take down a compile for a number
         # nothing depends on. Guard locally rather than rely on the caller's condition.
         split = _row_split(op, cores, work_slices) or 1
-        tile_rows_per_core = rows / split
+        tile_rows_per_core = sympy.Piecewise((rows / split, tiles_out_dim), (0.0, True))
 
     # PER-ARG, PER-LEVEL loop factors. An operand is re-transferred at a nesting level
     # whose tiled symbol its index does NOT contain, and walked (transferred once) at a
@@ -1071,14 +1082,11 @@ def extract_op_features(
         _write_index = None
     if _levels and _write_index is not None:
         out_factor = _loop_factor_for_index(_write_index, _levels)
-    elif tiling:  # unreadable index: every candidate-tiled arg taken as advancing
-        out_factor = 1
     else:  # no loop_info (or unreadable index) -> the pre-existing behaviour
-        out_factor = 1 if tiles_out_dim else loop_trip
-    if tiling:
-        in_factor = 1
-    else:
-        in_factor = 1 if (tiles_out_dim or is_tiled_red) else loop_trip
+        out_factor = sympy.Piecewise((1, tiles_out_dim), (loop_trip, True))
+    in_factor = sympy.Piecewise(
+        (1, sympy.Or(tiles_out_dim, is_tiled_red)), (loop_trip, True)
+    )
 
     # Traffic of an indirect mutation's store (see _indirect_write_elems). Symbolic
     # residency is the chooser's form and must not block it: indirect buffers are
@@ -1097,7 +1105,11 @@ def extract_op_features(
             is_lx=out_is_lx,
             # `dims`/`logical` stay the destination's: they describe the buffer
             # this write lands in, while `elems` counts the bytes it moves.
-            elems=out_elems if out_write_elems is None else out_write_elems,
+            elems=_per_tile_elems(
+                out_elems if out_write_elems is None else out_write_elems,
+                out_is_lx,
+                _tile_count(_write_index, tiling),
+            ),
             dims=list(out_dims),
             logical=list(out_size),
             loop_factor=out_factor,
@@ -1156,7 +1168,7 @@ def extract_op_features(
                 name=name,
                 role="input",
                 is_lx=inp_is_lx,
-                elems=in_elems,
+                elems=_per_tile_elems(in_elems, inp_is_lx, _tile_count(index, tiling)),
                 broadcast=broadcast,
                 dims=list(dims),
                 logical=list(in_logical) if in_logical else [],
@@ -1192,11 +1204,6 @@ def extract_op_features(
     transport_read_run_bytes, transport_tile_elems = (
         _transport_read_geometry(op, work_slices) if is_transport else (None, None)
     )
-    if tiling and loop_trip != 1:
-        # The calibrated law is per invocation, and a tile's contiguous runs are
-        # not derived here: leave a (possibly) tiled candidate unpriced, as any
-        # unsupported geometry is.
-        transport_read_run_bytes = transport_tile_elems = None
 
     features = OpFeatures(
         name=_op_name(op),
