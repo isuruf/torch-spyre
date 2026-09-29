@@ -2341,28 +2341,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # to an op the grouping will see -- a feature whose buffer is absent from
         # ``graph.operations`` would silently drop out of the objective.
         mem_usage = mem_usage_by_buf(graph)
-        op_features = {}
-        for output_name in mem_usage:
-            if not isinstance(graph.get_buffer(output_name), ComputedBuffer):
-                continue
-            if output_name not in bufmap:
-                continue
-            if output_name not in pricing_by_name:
-                continue
-            op_features[output_name] = self._extract_op_features(
-                graph,
-                output_name,
-                bufmap,
-                default_is_lx,
-                op=pricing_by_name[output_name],
-            )
+        feature_names = [
+            output_name
+            for output_name in mem_usage
+            if isinstance(graph.get_buffer(output_name), ComputedBuffer)
+            and output_name in bufmap
+            and output_name in pricing_by_name
+        ]
 
         from torch_spyre._inductor.cost_model import predict_bundles
 
         # Logged, not asserted: dropping a buffer from the objective changes what
         # the solver optimizes without failing anything, so it has to be visible,
         # but it is not worth killing a plan over. Empty today.
-        unscored = set(op_features) - {
+        unscored = set(feature_names) - {
             getattr(op, "name", None) for op in graph.operations
         }
         if unscored:
@@ -2392,7 +2384,21 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # change or a None in a term, is a silent objective loss no test can fail on.
         bundle_terms: list = []
         cost_params = _objective_cost_params(solver)
+        # Feature extraction runs inside the same fallback: a candidate tiling
+        # can raise Unsupported (an axis with no resolvable loop variable) or
+        # ValueError (candidates on an already coarse-tiled op), and either
+        # costs the objective, not the compile.
         try:
+            op_features = {
+                output_name: self._extract_op_features(
+                    graph,
+                    output_name,
+                    bufmap,
+                    default_is_lx,
+                    op=pricing_by_name[output_name],
+                )
+                for output_name in feature_names
+            }
             bundle_terms = predict_bundles(pricing_ops, op_features, params=cost_params)
             cost_expr = sympy.sympify(sum(term for _, term in bundle_terms))
         except (ValueError, RuntimeError, TypeError) as e:
@@ -2500,12 +2506,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         buffer = buffers[output_name]
         division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)
-        tiling: dict = {}
+        sym_tiling: dict = {}
         if config.unified_tiling:
             for (host_dim, is_reduction), symbol in buffer.sym_tile_counts.items():
                 var = tile_axis_loop_var(op, host_dim, is_reduction)
-                tiling[var] = tiling.get(var, 1) * symbol
-        return extract_op_features(op, ws, is_lx=is_lx, tiling=tiling or None)
+                sym_tiling[var] = sym_tiling.get(var, 1) * symbol
+        return extract_op_features(op, ws, is_lx=is_lx, sym_tiling=sym_tiling or None)
 
     def _finalize_lx_relayout_allocation(
         self,

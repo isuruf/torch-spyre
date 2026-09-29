@@ -1663,7 +1663,17 @@ def _reduction_rows(o):
         and (_is_sym(a.is_lx) or not a.is_lx)
         and len(a.logical) >= 2
     ]
-    return max(ins, key=lambda a: a.elems).logical[-2] if ins else 0
+    # A candidate tiling makes an undecided arg's `elems` symbolic (per-tile when
+    # LX-resident); rank it by its full extent, the device-dims product it has as
+    # HBM, since sympy expressions do not order.
+    return (
+        max(
+            ins,
+            key=lambda a: math.prod(a.dims) if _is_sym(a.elems) and a.dims else a.elems,
+        ).logical[-2]
+        if ins
+        else 0
+    )
 
 
 def reduction_read_bw(rows, p):

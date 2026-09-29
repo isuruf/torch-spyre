@@ -931,7 +931,7 @@ def extract_op_features(
     work_slices=None,
     *,
     is_lx: Optional[Mapping[str, bool]] = None,
-    tiling: Optional[Mapping] = None,
+    sym_tiling: Optional[Mapping] = None,
 ) -> OpFeatures:
     """Build OpFeatures for one ComputedBuffer op (best-effort).
 
@@ -943,7 +943,7 @@ def extract_op_features(
     name, such as a relayout candidate's forced placement. A name missing from
     it falls back to the buffer's committed layout.
 
-    ``tiling`` is a candidate coarse tiling of the (untiled) op during LX
+    ``sym_tiling`` is a candidate coarse tiling of the (untiled) op during LX
     planning: loop variable -> trip count, concrete or the solver's symbols, as
     ``work_slices`` is for the core split (see :func:`_candidate_tiling`).
     Otherwise the op's committed ``loop_info`` supplies the tiling. The op's
@@ -961,9 +961,9 @@ def extract_op_features(
     graph_inputs, graph_outputs = boundary if boundary is not None else (None, None)
     data = getattr(op, "data", None)
     is_reduction = getattr(data, "reduction_type", None) is not None
-    if tiling:
+    if sym_tiling:
         _levels, loop_trip, tiles_red_dim, tiles_out_dim, output_tiles = (
-            _candidate_tiling(op, tiling)
+            _candidate_tiling(op, sym_tiling)
         )
     else:
         loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
@@ -1021,8 +1021,8 @@ def extract_op_features(
             out_elems,
             dtype_bytes,
             # A candidate-tiled op is still untiled: its K is already the total.
-            1 if tiling else loop_trip,
-            False if tiling else is_tiled_red,
+            1 if sym_tiling else loop_trip,
+            False if sym_tiling else is_tiled_red,
             work_slices,
         )
         reduction_cores = k_split
@@ -1050,11 +1050,14 @@ def extract_op_features(
         # previously modelled; it only repairs rank>=3. Same class of mistake, and the
         # same fix, as _matmul_features' batch-dim exclusion above.
         rows = (out_size[-2] if len(out_size) >= 2 else 0) or out_dims[-2]
-        # full-buffer alloc: per-tile slice is rows / loop_trip
-        # A candidate-tiled op is still untiled, so its LX output's rows are also
-        # the whole loop's: the per-tile slice is rows / output tiles.
-        out_tiles = output_tiles if tiling else 1
-        rows = rows / loop_trip * (1 - out_is_lx) + rows / out_tiles * out_is_lx
+        if sym_tiling:
+            # A candidate-tiled op is still untiled, so its output's rows are the
+            # whole loop's in LX and HBM alike: the per-tile slice is rows / output
+            # tiles. Not loop_trip, which also counts reduction tiles.
+            rows = rows / output_tiles
+        else:
+            # full-buffer alloc: per-tile slice is rows / loop_trip
+            rows = rows / loop_trip * (1 - out_is_lx) + rows * out_is_lx
         # `loop_trip > 1` is guaranteed by the branch condition; `_row_split` can in
         # principle return 0 if a split map ever records one, and this term is a
         # diagnostic -- a ZeroDivisionError here would take down a compile for a number
@@ -1092,8 +1095,11 @@ def extract_op_features(
     # residency is the chooser's form and must not block it: indirect buffers are
     # never LX-resident, so is_lx is 0 in every legal solution. `out_elems` itself
     # stays the committed device size, which also sizes the compute terms.
+    # A candidate-tiled op is still untiled, and its HBM output keeps the full
+    # extent (see _per_tile_elems), so the store is sized whole under any
+    # candidate -- `loop_trip` is then symbolic and `== 1` would always be False.
     out_write_elems = None
-    if not is_reduction and loop_trip == 1 and out_is_lx is not True:
+    if not is_reduction and (sym_tiling or loop_trip == 1) and out_is_lx is not True:
         out_write_elems = _indirect_write_elems(op, out_elems)
 
     args: list = []
@@ -1108,7 +1114,7 @@ def extract_op_features(
             elems=_per_tile_elems(
                 out_elems if out_write_elems is None else out_write_elems,
                 out_is_lx,
-                _tile_count(_write_index, tiling),
+                _tile_count(_write_index, sym_tiling),
             ),
             dims=list(out_dims),
             logical=list(out_size),
@@ -1168,7 +1174,9 @@ def extract_op_features(
                 name=name,
                 role="input",
                 is_lx=inp_is_lx,
-                elems=_per_tile_elems(in_elems, inp_is_lx, _tile_count(index, tiling)),
+                elems=_per_tile_elems(
+                    in_elems, inp_is_lx, _tile_count(index, sym_tiling)
+                ),
                 broadcast=broadcast,
                 dims=list(dims),
                 logical=list(in_logical) if in_logical else [],

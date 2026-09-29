@@ -627,7 +627,7 @@ class SymbolicMatmulSplitCostTest(TestCase):
 class SymbolicTileCountCostTest(TestCase):
     """A candidate coarse tiling whose tile COUNT is an undecided symbol.
 
-    ``extract_op_features(tiling=...)`` hands ``predict_ops`` a
+    ``extract_op_features(sym_tiling=...)`` hands ``predict_ops`` a
     ``tiles_output_dim`` that is a CONDITION (``tile > 1``) rather than a bool,
     since the solver may pick the candidate that leaves the axis untiled. Every
     branch on the flag goes through ``cost_model._select``; binding the symbol
@@ -670,6 +670,41 @@ class SymbolicTileCountCostTest(TestCase):
                     )
                 checked += 1
         self.assertGreater(checked, 10)
+
+    def test_reduction_rows_ranks_symbolic_per_tile_inputs(self):
+        # A candidate tiling makes an undecided input's elems per-tile when
+        # LX-resident; the governing-rows argmax used to compare those sympy
+        # expressions and raise "cannot determine truth value of Relational".
+        from torch_spyre._inductor.cost_model import _reduction_rows
+
+        is_lx = sympy.Symbol("is_lx_buf1", integer=True, nonnegative=True)
+
+        def arg(name, dims, logical, is_lx=False):
+            elems = math.prod(dims)
+            if isinstance(is_lx, sympy.Basic):
+                elems = elems * (1 - is_lx) + elems / self.TILE * is_lx
+            return ArgTraffic(
+                name=name,
+                role="input",
+                is_lx=is_lx,
+                elems=elems,
+                dims=dims,
+                logical=logical,
+            )
+
+        op = OpFeatures(
+            name="sum",
+            is_reduction=True,
+            out_elems=64,
+            cores=1,
+            dtype_bytes=2,
+            args=[
+                arg("buf0", [16, 64], [16, 64], is_lx),
+                arg("buf1", [256, 64], [256, 64], is_lx),
+                arg("buf2", [1, 64], [1, 64]),
+            ],
+        )
+        self.assertEqual(_reduction_rows(op), 256)
 
 
 if __name__ == "__main__":
