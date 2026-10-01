@@ -2175,33 +2175,20 @@ class TestInvScale(TestCase):
                 self.assertLessEqual(self._max_error(raw, scale), self.MAX_ERROR)
 
 
-@unittest.skipUnless(_HAS_ORTOOLS, "the CP-SAT objective params need ortools")
 class TestObjectiveCostParams(TestCase):
-    """Only CP-SAT drops the tile-height derates it cannot linearize; the
-    annealer evaluates its objective numerically and keeps the calibrated ones."""
+    """Every solver's objective drops the tile-height derates."""
 
-    def test_cpsat_neutralizes_the_derates(self):
+    def test_the_objective_neutralizes_the_derates(self):
         from torch_spyre._inductor.cost_model import coarse_underfill_eff
         from torch_spyre._inductor.scratchpad.allocator import (
             _COST_PARAMS,
-            _CPSAT_COST_PARAMS,
-            _objective_cost_params,
-        )
-        from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
-            SaCoOptimizingSolver,
+            _OBJECTIVE_COST_PARAMS,
         )
 
-        self.assertIs(
-            _objective_cost_params(CpSatLayoutSolver([], 1 << 20)),
-            _CPSAT_COST_PARAMS,
-        )
-        self.assertIs(
-            _objective_cost_params(SaCoOptimizingSolver([], 1 << 20)), _COST_PARAMS
-        )
-        # A symbolic tile height leaves no fractional power behind for CP-SAT.
+        # A symbolic tile height leaves no fractional power behind.
         is_lx, split = sympy.symbols("is_lx_buf0 split_buf0_d0", positive=True)
         rpc = (256 * (1 - is_lx) + 1024 * is_lx) / split
-        eff = sympy.sympify(coarse_underfill_eff(rpc, 512, _CPSAT_COST_PARAMS))
+        eff = sympy.sympify(coarse_underfill_eff(rpc, 512, _OBJECTIVE_COST_PARAMS))
         self.assertFalse(eff.free_symbols)
         self.assertEqual(float(eff), 1.0)
         self.assertLess(coarse_underfill_eff(2.0, 512, _COST_PARAMS), 1)
