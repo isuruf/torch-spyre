@@ -145,27 +145,21 @@ _COST_PARAMS = CostParams(
     # which optimizes compute only when there's a matmul
     overlap_gamma=0.46,
     use_bundled_cost_model=False,
-)
-# The objective's variant, for every solver, with three tiling terms off.
-#
-# The coarse underfill and LX-spill derates: zero exponents drop the tile height
-# from both (``rpc**0 == 1``) and the 1.0 cap pins the underfill there, so each
-# derate is exactly 1. CP-SAT cannot lower their fractional powers of a symbolic
-# tile height at all (the whole cost objective would fall back to the
-# lexicographic one). The annealer can, but is misled by them: the underfill
-# derate divides a whole bundle's memory term by the efficiency of its smallest
-# tile, which over-prices a tile several times over on real decoder blocks.
-#
-# The loop-invariant re-read: ``read_bytes`` already charges a tiled matmul's
-# invariant operand once per iteration through its ``loop_factor``, and
-# ``_loop_reread_bytes`` charges the repeats again.
-_OBJECTIVE_COST_PARAMS = replace(
-    _COST_PARAMS,
+    # The coarse underfill and LX-spill derates: zero exponents drop the tile height
+    # from both (``rpc**0 == 1``) and the 1.0 cap pins the underfill there, so each
+    # derate is exactly 1. CP-SAT cannot lower their fractional powers of a symbolic
+    # tile height at all (the whole cost objective would fall back to the
+    # lexicographic one). The annealer can, but is misled by them: the underfill
+    # derate divides a whole bundle's memory term by the efficiency of its smallest
+    # tile, which over-prices a tile several times over on real decoder blocks.
     coarse_underfill_exp=0.0,
     coarse_underfill_col_exp=0.0,
     coarse_underfill_cap=1.0,
     lx_spill_exp=0.0,
     mm_spill_ws_exp=0.0,
+    # The loop-invariant re-read: ``read_bytes`` already charges a tiled matmul's
+    # invariant operand once per iteration through its ``loop_factor``, and
+    # ``_loop_reread_bytes`` charges the repeats again.
     loop_reread_scale=0.0,
 )
 
@@ -2396,7 +2390,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 for output_name in feature_names
             }
             bundle_terms = predict_bundles(
-                pricing_ops, op_features, params=_OBJECTIVE_COST_PARAMS
+                pricing_ops, op_features, params=_COST_PARAMS
             )
             cost_expr = sympy.sympify(sum(term for _, term in bundle_terms))
         except (ValueError, RuntimeError, TypeError) as e:
@@ -2478,7 +2472,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     cost_expr,
                     bundle_terms,
                     result,
-                    _OBJECTIVE_COST_PARAMS,
+                    _COST_PARAMS,
                     context=context,
                 ),
             )
@@ -2509,9 +2503,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)
         sym_tiling: dict = {}
-        for (host_dim, is_reduction), symbol in buffer.sym_tile_counts.items():
-            var = tile_axis_loop_var(op, host_dim, is_reduction)
-            sym_tiling[var] = sym_tiling.get(var, 1) * symbol
+        if config.auto_coarse_tiling:
+            for (host_dim, is_reduction), symbol in buffer.sym_tile_counts.items():
+                var = tile_axis_loop_var(op, host_dim, is_reduction)
+                sym_tiling[var] = sym_tiling.get(var, 1) * symbol
         return extract_op_features(op, ws, is_lx=is_lx, sym_tiling=sym_tiling or None)
 
     def _finalize_lx_relayout_allocation(
