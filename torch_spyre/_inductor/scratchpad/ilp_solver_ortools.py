@@ -920,6 +920,11 @@ class _SympyExprToCpSat(Printer):
         if name in self._sym_map:
             return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
 
+        if any(arg.is_boolean for arg in ints):
+            product = self._print_gated_product(ints)
+            self._sym_map[name] = product
+            return self._print_multiply_two(math.prod(nonints), product)
+
         # The product is multilinear (degree 1 in each factor), so its
         # extrema over the box of bounds occur at the box's vertices. Rather
         # than enumerating all 2**len(ints) vertices, fold the bounds
@@ -946,6 +951,31 @@ class _SympyExprToCpSat(Printer):
         self._model.add_multiplication_equality(product, ints)
         self._sym_map[name] = product
         return self._print_multiply_two(math.prod(nonints), product)
+
+    def _print_gated_product(self, ints):
+        """A product with boolean factors as the product of the others, gated
+        by each boolean: a variable equal to it while the boolean holds and 0
+        otherwise, two linear constraints enforced on the literal (as in
+        ``_print_RelayoutCharge``), instead of a ``multiplication_equality``
+        the solver can only propagate through bounds."""
+        gates = [arg for arg in ints if arg.is_boolean]
+        rest = [arg for arg in ints if not arg.is_boolean]
+        if not rest:
+            value, gates = gates[0], gates[1:]
+        elif len(rest) == 1:
+            value = rest[0]
+        else:
+            value = self._print_multiply(rest)
+        for gate in gates:
+            lb, ub = self._affine_bounds(value)
+            gated = self._model.new_int_var(
+                min(0, int(lb)), max(0, int(ub)), f"_gated_{gate.name}_{self._count}"
+            )
+            self._count += 1
+            self._model.add(gated == value).only_enforce_if(gate)
+            self._model.add(gated == 0).only_enforce_if(gate.Not())
+            value = gated
+        return value
 
     def _print_Symbol(self, expr):
         if expr.name in self._sym_map:

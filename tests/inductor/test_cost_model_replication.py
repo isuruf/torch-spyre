@@ -763,3 +763,22 @@ def test_the_allocator_tabulates_each_candidates_splits_in_order():
         DECODE_DIVISION,
         ((4, 1, 32), (8, 1, 32), (1, 1, 16)),
     )
+
+
+@pytest.mark.parametrize("resident", [0, 1])
+@pytest.mark.parametrize("value", [-3, 0, 5])
+def test_cp_sat_bool_times_int_is_the_int_while_the_bool_holds(resident, value):
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+
+    b, x = sympy.symbols("b x", integer=True)
+    model = cp_model.CpModel()
+    bool_var, int_var = model.new_bool_var("b"), model.new_int_var(-4, 6, "x")
+    model.add(bool_var == resident)
+    model.add(int_var == value)
+    sym_map = {"b": bool_var, "x": int_var}
+    model.minimize(_SympyExprToCpSat(model, sym_map, {}).convert(2 * b * x + 1))
+    assert not any(c.has_int_prod() for c in model.proto.constraints)
+    solver = cp_model.CpSolver()
+    assert solver.Solve(model) == cp_model.OPTIMAL
+    assert solver.ObjectiveValue() == 2 * resident * value + 1
