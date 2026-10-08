@@ -1003,7 +1003,9 @@ def _select(flag, if_true, if_false):
     the solver's symbols -- ``OpFeatures.tiles_output_dim`` under a candidate
     tiling, which may choose to leave every output axis untiled -- as a
     ``Piecewise`` then. Both engines lower it: CP-SAT as reified literals,
-    ``lambdify`` directly."""
+    ``lambdify`` directly. Both arms are evaluated eagerly, so the unused one
+    must be safe to compute (e.g. ``underfill_eff`` returns 1.0 for
+    ``rows <= 0``)."""
     if isinstance(flag, sympy.Basic) and flag not in (sympy.true, sympy.false):
         return sympy.Piecewise((if_true, flag), (if_false, True))
     return if_true if flag else if_false
@@ -1882,6 +1884,12 @@ def _lazy_min(r, w):
     return min(r, w)
 
 
+def _peak_mem_ns(r, w, p: CostParams):
+    """HBM time for ``r`` read and ``w`` written bytes at the peak rate, plus
+    the read/write turnaround."""
+    return (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
+
+
 def _store_core_excess_ns(ops: list, p: "CostParams"):
     """Extra write time when the writing cores cannot saturate the shared bus.
 
@@ -2097,9 +2105,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
             if bw:
                 mem += (ro + wo) / bw
             else:
-                mem += (
-                    ro + wo
-                ) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(ro, wo)
+                mem += _peak_mem_ns(ro, wo, p)
     elif (
         len(ops) == 1
         and ops[0].is_reduction
@@ -2120,7 +2126,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         # A candidate tiling that tiles an output axis takes the default rate below.
         mem = _select(
             ops[0].tiles_output_dim,
-            (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w),
+            _peak_mem_ns(r, w, p),
             (r + w) / _bw,
         )
     elif (
@@ -2147,9 +2153,9 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         # cores ladder with repeats -- the present cells are one shape, one log, n=1 per
         # config. The throughput term is added to `compute` below, after `mem` receives
         # the underfill/spill derates, so those memory effects do not inflate it.
-        mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
+        mem = _peak_mem_ns(r, w, p)
     else:
-        mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
+        mem = _peak_mem_ns(r, w, p)
     # Replace the stores' peak-rate charge with the writing cores' limited rate.
     mem = mem + _store_core_excess_ns(ops, p)
     # Sharing slows delivery of these same reads; it does not add HBM bytes.
@@ -2288,7 +2294,7 @@ def _explain_matmul_bundled(lines: list, ops: list, p: CostParams) -> str:
     eff, eff_rows = 1.0, None
     for o in ops:
         rpc = o.tile_rows_per_core
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc != 0.0:
+        if o.tiles_output_dim:
             e = coarse_underfill_eff_matmul(rpc, p)
             if e < eff:
                 eff, eff_rows = e, rpc
@@ -2599,7 +2605,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     eff, eff_rows, eff_cols = 1.0, None, 0.0
     for o in ops:
         rpc = o.tile_rows_per_core
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc != 0.0:
+        if o.tiles_output_dim:
             e = coarse_underfill_eff(rpc, _op_cols(o), p)
             if e < eff:
                 eff, eff_rows, eff_cols = e, rpc, _op_cols(o)
