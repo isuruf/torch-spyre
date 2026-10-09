@@ -983,6 +983,11 @@ class _SympyExprToCpSat(Printer):
         if name in self._sym_map:
             return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
 
+        if any(arg.is_boolean for arg in ints):
+            product = self._print_gated_product(ints, name)
+            self._sym_map[name] = product
+            return self._print_multiply_two(math.prod(nonints), product)
+
         # The product is multilinear (degree 1 in each factor), so its
         # extrema over the box of bounds occur at the box's vertices. Rather
         # than enumerating all 2**len(ints) vertices, fold the bounds
@@ -1009,6 +1014,34 @@ class _SympyExprToCpSat(Printer):
         self._model.add_multiplication_equality(product, ints)
         self._sym_map[name] = product
         return self._print_multiply_two(math.prod(nonints), product)
+
+    def _print_gated_product(self, ints, name):
+        """A product with boolean factors as the product of the others, gated
+        by each boolean: a variable equal to it while the booleans hold and 0
+        otherwise, two linear constraints enforced on the literal (as in
+        ``_print_RelayoutCharge``), instead of a ``multiplication_equality``
+        the solver can only propagate through bounds."""
+        gates = [arg for arg in ints if arg.is_boolean]
+        rest = [arg for arg in ints if not arg.is_boolean]
+        if not rest:
+            value, gates = gates[0], gates[1:]
+        elif len(rest) == 1:
+            value = rest[0]
+        else:
+            value = self._print_multiply(rest)
+        if len(gates) == 1:
+            gate = gates[0]
+        else:
+            gate = self._model.new_bool_var(f"{name}_gate")
+            self._model.add_bool_and(gates).only_enforce_if(gate)
+            self._model.add_bool_or([g.Not() for g in gates]).only_enforce_if(
+                gate.Not()
+            )
+        lb, ub = self._affine_bounds(value)
+        gated = self._model.new_int_var(min(0, int(lb)), max(0, int(ub)), name)
+        self._model.add(gated == value).only_enforce_if(gate)
+        self._model.add(gated == 0).only_enforce_if(gate.Not())
+        return gated
 
     def _print_Symbol(self, expr):
         if expr.name in self._sym_map:
