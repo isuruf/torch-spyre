@@ -189,6 +189,43 @@ def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
     model.AddBoolOr(pair_lits).OnlyEnforceIf(enforce_lit)
 
 
+def _eq_fact(rel):
+    """``(lhs, number)`` for ``Eq``/``Ne`` with a numeric side, else None."""
+    lhs, rhs = rel.args
+    if isinstance(rhs, sympy.Number):
+        return lhs, rhs
+    if isinstance(lhs, sympy.Number):
+        return rhs, lhs
+    return None
+
+
+def _simplify_eq_conjunction(expr):
+    """Cheap stand-in for ``sympy.simplify`` on a conjunction: resolve its
+    ``Eq(x, c)`` terms against each other and against ``Ne(x, c')`` terms,
+    e.g. ``And(Eq(x, 2), Ne(x, 4)) -> Eq(x, 2)`` and
+    ``And(Eq(x, 2), Eq(x, 4)) -> false``. Anything else is kept as is."""
+    if not isinstance(expr, sympy.And):
+        return expr
+    eqs: dict = {}
+    for arg in expr.args:
+        if isinstance(arg, sympy.Eq) and (fact := _eq_fact(arg)) is not None:
+            lhs, val = fact
+            if eqs.setdefault(lhs, val) != val:
+                return sympy.false
+    if not eqs:
+        return expr
+    kept = []
+    for arg in expr.args:
+        if isinstance(arg, sympy.Ne) and (fact := _eq_fact(arg)) is not None:
+            lhs, val = fact
+            if lhs in eqs:
+                if eqs[lhs] == val:
+                    return sympy.false
+                continue  # implied by Eq(lhs, eqs[lhs])
+        kept.append(arg)
+    return sympy.And(*kept)
+
+
 @dataclass
 class _LifetimeBufferWithCpVars(Generic[_BufT]):
     """A :class:`LifetimeBoundBuffer` bundled with the CP-SAT variables the
@@ -1082,22 +1119,21 @@ class _SympyExprToCpSat(Printer):
         args = expr.args
         assert args[-1][1] == sympy.true
         result = 0
-        not_prev = []
+        none_prev = sympy.true  # no earlier condition held
         for val, cond in args:
-            if cond == sympy.true:
-                lits = not_prev
-            else:
-                cond_var = self._print_condition(cond)
-                lits = [cond_var, *not_prev]
-                not_prev = [*not_prev, cond_var.Not()]
-            piecewise_var = self._model.new_bool_var(f"piecewise_{self._count}")
-            self._count += 1
-            self._model.AddBoolAnd(lits).OnlyEnforceIf(piecewise_var)
-            self._model.AddBoolOr([lit.Not() for lit in lits]).OnlyEnforceIf(
-                piecewise_var.Not()
-            )
+            lit = _simplify_eq_conjunction(sympy.And(none_prev, cond))
+            if lit == sympy.false:
+                continue
+            if lit == sympy.true:
+                result += self._print(val)
+                break
+            piecewise_var = self._print_condition(lit)
             result += self._print_multiply_two(piecewise_var, self._print(val))
+            none_prev = sympy.And(none_prev, sympy.Not(cond))
         return result
+
+    def _print_Not(self, expr):
+        return self._print_condition(expr.args[0]).Not()
 
     def _print_Relational(self, expr):
         return _operator_map[expr.rel_op](*[self._print(arg) for arg in expr.args])
