@@ -574,6 +574,25 @@ def _lazy_minmax(expr: sympy.Expr) -> sympy.Expr:
     return expr.func(*args)
 
 
+class memoize_method:
+    """Descriptor that memoizes a method separately for each instance.
+
+    The cache lives in the instance ``__dict__``, so it is freed with the
+    instance and never shared between instances.
+    """
+
+    def __init__(self, func):
+        self.func = func
+
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+        bound_cache = cache(self.func.__get__(instance, owner))
+        # Shadow the descriptor so later lookups hit the cached method directly.
+        instance.__dict__[self.func.__name__] = bound_cache
+        return bound_cache
+
+
 class _SympyExprToCpSat(Printer):
     """Translates a sympy cost expression into an OR-Tools CP-SAT expression
     over an existing ``sympy symbol -> CP-SAT var`` mapping.
@@ -1028,6 +1047,7 @@ class _SympyExprToCpSat(Printer):
             return self._print_multiply_two(base, base)
         return self._print(expr.base) ** self._print(expr.exp)
 
+    @memoize_method
     def _print_condition(self, cond):
         if not isinstance(cond, sympy.core.relational.Relational):
             return self._print(cond)
@@ -1039,6 +1059,7 @@ class _SympyExprToCpSat(Printer):
         self._model.Add(not_cond_expr).OnlyEnforceIf(var.Not())
         return var
 
+    @memoize_method
     def _print_And(self, expr):
         lits = [self._print_condition(arg) for arg in expr.args]
         and_var = self._model.new_bool_var(f"and_{self._count}")
@@ -1047,6 +1068,7 @@ class _SympyExprToCpSat(Printer):
         self._model.AddBoolOr([lit.Not() for lit in lits]).OnlyEnforceIf(and_var.Not())
         return and_var
 
+    @memoize_method
     def _print_Or(self, expr):
         lits = [self._print_condition(arg) for arg in expr.args]
         or_var = self._model.new_bool_var(f"or_{self._count}")
@@ -1055,6 +1077,7 @@ class _SympyExprToCpSat(Printer):
         self._model.AddBoolAnd([lit.Not() for lit in lits]).OnlyEnforceIf(or_var.Not())
         return or_var
 
+    @memoize_method
     def _print_Piecewise(self, expr):
         args = expr.args
         assert args[-1][1] == sympy.true

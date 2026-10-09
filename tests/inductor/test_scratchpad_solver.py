@@ -1679,6 +1679,40 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertEqual(solver.ObjectiveValue(), 20)
         self.assertEqual(solver.Value(sym_map["x"]), 10)
 
+    def test_a_repeated_condition_reuses_its_literal(self):
+        x, y = sympy.symbols("x y", integer=True)
+        model = cp_model.CpModel()
+        sym_map = {
+            "x": model.new_int_var(0, 10, "x"),
+            "y": model.new_int_var(0, 10, "y"),
+        }
+        printer = _SympyExprToCpSat(model, sym_map, {})
+        for cond in (x >= 3, sympy.And(x >= 3, y <= 4), sympy.Or(x <= 1, y >= 7)):
+            lit = printer._print_condition(cond)
+            num_vars = len(model.proto.variables)
+            num_constraints = len(model.proto.constraints)
+            self.assertIs(printer._print_condition(cond), lit)
+            self.assertEqual(len(model.proto.variables), num_vars)
+            self.assertEqual(len(model.proto.constraints), num_constraints)
+
+    def test_condition_literals_are_not_shared_between_printers(self):
+        x = sympy.Symbol("x", integer=True)
+        model = cp_model.CpModel()
+        sym_map = {"x": model.new_int_var(0, 10, "x")}
+        first = _SympyExprToCpSat(model, sym_map, {})._print_condition(x >= 3)
+        second = _SympyExprToCpSat(model, sym_map, {})._print_condition(x >= 3)
+        self.assertIsNot(first, second)
+
+    def test_a_condition_repeated_across_piecewises_lowers_correctly(self):
+        x = sympy.Symbol("x", integer=True)
+        expr = sympy.Piecewise((1, x >= 3), (5, True)) + sympy.Piecewise(
+            (2 * x, x >= 3), (0, True)
+        )
+        for value in range(6):
+            solver, _ = self._optimize(expr, {"x": (value, value)}, maximize=True)
+            expected = 1 + 2 * value if value >= 3 else 5
+            self.assertEqual(solver.ObjectiveValue(), expected)
+
     def test_shared_load_penalty_lowers_for_product_degrees(self):
         from torch_spyre._inductor.work_division import _matmul_multicast_penalty
 
