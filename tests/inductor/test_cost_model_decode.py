@@ -1078,18 +1078,20 @@ def test_the_extractor_marks_the_reads_that_advance_with_the_loop_variable(monke
     assert advances["op_buf1"] is False
 
 
-def test_partitionability_requires_a_legal_menu_split_of_the_read_index():
+def test_partitions_count_the_splits_of_the_symbols_a_read_indexes():
     index = 64 * d1 + d2
-    assert not dcm._has_partitioning_candidate(index, None)
-    assert not dcm._has_partitioning_candidate(index, [])
-    assert not dcm._has_partitioning_candidate(index, [{d0: 32, d1: 1}])
-    assert not dcm._has_partitioning_candidate(index, [{d1: sympy.Symbol("split")}])
-    assert not dcm._has_partitioning_candidate(None, [{d1: 2}])
-    assert dcm._has_partitioning_candidate(index, [{d0: 32}, {d1: 2}])
-    assert dcm._has_partitioning_candidate(index, [{d2: sympy.Integer(4)}])
+    split = sympy.Symbol("split", integer=True, positive=True)
+    assert dcm._partitions(index, {}) == 1
+    assert dcm._partitions(None, {d1: 2}) == 1
+    assert dcm._partitions(index, {d0: 32, d1: 1}) == 1
+    assert dcm._partitions(index, {d0: 32, d1: 2, d2: 4}) == 8
+    assert dcm._partitions(index, {d0: 4, d1: split}) == split
 
 
-def test_the_extractor_uses_the_same_menu_for_every_priced_candidate(monkeypatch):
+def test_the_extractor_reads_partitioning_from_the_priced_division(monkeypatch):
+    """Whether a read is partitioned is a property of the division being priced,
+    not of the caller's menu: the same op and menu give a replicated candidate 1
+    and a partitioning one its split, and the menu does not change either."""
     op = _looped_op(
         [128],
         [[]],
@@ -1097,32 +1099,17 @@ def test_the_extractor_uses_the_same_menu_for_every_priced_candidate(monkeypatch
         write_index=64 * d0 + d2,
         read_indices=[704 * d2 + 1982464 * u0],
     )
-    # One candidate only replicates this read; the other partitions it. Both
-    # retain the estimate because the legal menu offers a partitioning choice.
     menu = [{d0: 16, d2: 1}, {d0: 8, d2: 2}]
-    for chosen in menu:
-        features = _features(
-            monkeypatch,
-            op,
-            {d0: 32, d2: 128},
-            work_slices=chosen,
-            candidate_work_slices=menu,
-        )
-        assert next(
-            a for a in features.args if a.name == "arg0"
-        ).has_partitioning_candidate
-
-    # The shape and bytes are unchanged. Remove the partitioning option and
-    # applicability declines; this is not a byte-size cutoff or a chosen-split test.
-    for menu_without_partition in (None, [{d0: 8, d2: 1}, {d0: 16, d2: 1}]):
-        features = _features(
-            monkeypatch,
-            op,
-            {d0: 32, d2: 128},
-            work_slices={d0: 16, d2: 1},
-            candidate_work_slices=menu_without_partition,
-        )
-        assert not any(a.has_partitioning_candidate for a in features.args)
+    for chosen, partitions in zip(menu, (1, 2)):
+        for candidates in (menu, None):
+            features = _features(
+                monkeypatch,
+                op,
+                {d0: 32, d2: 128},
+                work_slices=chosen,
+                candidate_work_slices=candidates,
+            )
+            assert _read(features, "arg0").partitions == partitions
 
 
 def test_an_op_without_a_for_each_tile_variable_marks_no_read_as_advancing(monkeypatch):
@@ -1145,7 +1132,7 @@ def test_an_op_without_a_for_each_tile_variable_marks_no_read_as_advancing(monke
 # ------------------------- loop-delivery eligibility: one per-read verdict
 #
 # ``advances_with_loop_var`` gates the loop-delivery term (with ``loop_factor == 1``
-# and a partitioning candidate). It follows the same per-read verdict as
+# and a partitioned read). It follows the same per-read verdict as
 # ``loop_factor``: the lowering's stamp, else a nonzero coefficient on the level's
 # variable. Each test asserts the flag and the factor together, since only their
 # combination prices.
@@ -1187,11 +1174,11 @@ def test_a_squeezed_advance_stamp_is_eligible_without_the_variable_in_the_index(
     op.loop_info.tiled_dims_per_read = [[[]]]
     op.loop_info.squeezed_advance_per_read = [[[(sympy.Integer(4096), 1)]]]
     walked = _read(
-        _features(monkeypatch, op, {d0: 64, d2: 64}, candidate_work_slices=[{d2: 4}]),
+        _features(monkeypatch, op, {d0: 64, d2: 64}, work_slices={d0: 1, d2: 4}),
         "arg0",
     )
     assert (walked.advances_with_loop_var, walked.loop_factor) == (True, 1)
-    assert walked.has_partitioning_candidate
+    assert walked.partitions == 4
 
 
 def test_a_zero_coefficient_loop_variable_is_not_eligible_without_stamps(monkeypatch):
@@ -1233,8 +1220,8 @@ def test_a_read_walked_only_by_the_levels_tiled_dim_is_a_coarse_loop_read(
 
 # Through the callers. The allocator builds its objective from
 # ``CoOptimizingAllocator._extract_op_features`` (the legal menu goes in) and prices
-# with its own ``_COST_PARAMS``; the report calls ``extract_op_features(op)`` with no
-# menu and the default params.
+# with its own ``_COST_PARAMS``; the report calls ``extract_op_features(op)`` on the
+# committed division and the default params.
 
 
 def _row_tiled_expert_matmul(read_stamps):
@@ -1265,7 +1252,9 @@ def _row_tiled_expert_matmul(read_stamps):
 _ADVANCES = [[(0, sympy.Integer(64))]]  # one level, advancing
 _PINNED = [[]]  # one level, the explicit "pinned" verdict
 _IT_SPACE = {d0: 64, d1: 64, d2: 64}
-_MENU = [{d0: 2, d1: 4}, {d1: 8}]  # 8 cores: the delivery estimate is nonzero
+# 8 cores: the delivery estimate is nonzero. The first candidate splits the
+# activation 2 ways (d0) and the bank 4 ways (d1).
+_MENU = [{d0: 2, d1: 4}, {d1: 8}]
 
 
 def _allocator_features(
@@ -1316,11 +1305,11 @@ def test_the_allocator_prices_loop_delivery_only_for_reads_the_loop_variable_wal
         monkeypatch, _row_tiled_expert_matmul([_ADVANCES, _ADVANCES])
     )
     flags = {
-        a.name: (a.advances_with_loop_var, a.loop_factor, a.has_partitioning_candidate)
+        a.name: (a.advances_with_loop_var, a.loop_factor, a.partitions)
         for a in walked.args
         if a.role == "input"
     }
-    assert flags == {"arg0": (True, 1, True), "arg1": (True, 1, True)}
+    assert flags == {"arg0": (True, 1, 2), "arg1": (True, 1, 4)}
     assert _delivery_ns(walked) > _delivery_ns(_without(walked, "arg0")) > 0
 
 
@@ -1341,27 +1330,31 @@ def test_a_read_whose_advance_moved_to_its_restickify_copy_gets_no_loop_delivery
     )
     activation, bank = _read(moved, "arg0"), _read(moved, "arg1")
     assert (activation.advances_with_loop_var, activation.loop_factor) == (False, 1)
-    assert activation.has_partitioning_candidate
+    assert activation.partitions == 2
     assert (bank.advances_with_loop_var, bank.loop_factor) == (True, 1)
     assert _delivery_ns(moved) == pytest.approx(_delivery_ns(_without(moved, "arg0")))
     assert _delivery_ns(moved) > 0
 
 
-def test_the_report_omits_the_loop_delivery_estimate(monkeypatch):
-    """The report extracts without the legal menu, so no read has partitioning
-    evidence and the estimate is omitted for every shape, eligible or not. Its
-    totals therefore need not rank eligible looped-matmul plans as the allocator
-    does."""
-    from torch_spyre._inductor.cost_model import CostParams
+def test_the_report_prices_loop_delivery_as_the_allocator_does(monkeypatch):
+    """The gate reads only the priced division, so the report, which extracts on the
+    committed division without the legal menu, charges the allocator's estimate for
+    that division. Without a division nothing is partitioned and nothing is charged."""
+    from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
 
     op = _row_tiled_expert_matmul([_ADVANCES, _ADVANCES])
-    report = _features(monkeypatch, op, _IT_SPACE)
-    assert [a.advances_with_loop_var for a in report.args if a.role == "input"] == [
-        True,
-        True,
-    ]
-    assert not any(a.has_partitioning_candidate for a in report.args)
-    assert _delivery_ns(report, CostParams()) == 0
+    allocator = _allocator_features(monkeypatch, op)
+    report = _features(
+        monkeypatch,
+        op,
+        _IT_SPACE,
+        work_slices={d: _MENU[0].get(d, 1) for d in _IT_SPACE},
+    )
+    assert _delivery_ns(report, _COST_PARAMS) == pytest.approx(_delivery_ns(allocator))
+    assert _delivery_ns(report) > 0
+    undivided = _features(monkeypatch, op, _IT_SPACE)
+    assert [a.partitions for a in undivided.args if a.role == "input"] == [1, 1]
+    assert _delivery_ns(undivided) == 0
 
 
 def test_a_rebased_bank_read_keeps_the_estimate_of_its_pre_rebase_form(monkeypatch):
@@ -1379,9 +1372,7 @@ def test_a_rebased_bank_read_keeps_the_estimate_of_its_pre_rebase_form(monkeypat
     priced = _allocator_features(monkeypatch, rebased)
     bank_after = _read(priced, "arg1")
     assert (bank_after.advances_with_loop_var, bank_after.loop_factor) == (True, 1)
-    assert (
-        bank_after.has_partitioning_candidate == bank_before.has_partitioning_candidate
-    )
+    assert bank_after.partitions == bank_before.partitions
     assert _delivery_ns(priced) == pytest.approx(
         _delivery_ns(_allocator_features(monkeypatch, before))
     )
@@ -1557,8 +1548,8 @@ def test_a_looped_operand_read_is_charged_the_slower_of_requests_and_delivery(
     """Through the allocator's extraction and params: the bank's DMA requests and
     its loop-delivery estimate are excess time over the same bytes/peak, so the read
     is charged the larger, never the sum. Short runs add requests; long runs, or a
-    delivery-bound read, keep the previous price. The report extracts without the
-    legal menu, so it has no delivery estimate and charges the requests alone."""
+    delivery-bound read, keep the previous price. The report, extracting on the same
+    division without the legal menu, charges the same excess."""
     from torch_spyre._inductor.cost_model import CostParams, predict_ops
     from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
 
@@ -1595,9 +1586,7 @@ def test_a_looped_operand_read_is_charged_the_slower_of_requests_and_delivery(
         graph=graph,
         work_slices={s: split.get(s, 1) for s in space},
     )
-    assert _requests_ns([report], CostParams()) == pytest.approx(
-        max(0.0, requests), rel=1e-9
-    )
+    assert _requests_ns([report], CostParams()) == pytest.approx(added, rel=1e-9)
 
 
 @pytest.mark.parametrize(
@@ -1691,14 +1680,14 @@ def test_a_stamped_level_without_a_loop_variable_follows_its_stamp(monkeypatch):
 def test_a_stamped_coarse_loop_read_keeps_loop_delivery_disabled(monkeypatch):
     """Complete coarse-loop stamps affect traffic, without enabling loop delivery.
 
-    The allocator has a legal partitioning menu, but no paired for_each_tile
-    variable. Applying #4995's stamp-precedence fix must keep that distinction.
+    The allocator's division partitions the read, but there is no paired
+    for_each_tile variable. Applying #4995's stamp-precedence fix must keep that distinction.
     """
     op = _row_tiled_expert_matmul([_ADVANCES, _PINNED])
     op.dim_hints = []
     feature = _allocator_features(monkeypatch, op)
     read = _read(feature, "arg0")
     assert read.loop_factor == 1
-    assert read.has_partitioning_candidate
+    assert read.partitions == 2
     assert not read.advances_with_loop_var
     assert _delivery_ns(feature) == 0
