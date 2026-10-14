@@ -19,11 +19,11 @@ Walks ``graph.operations`` and builds :class:`cost_model.OpFeatures` per op
 then a dump hook (``SPYRE_DUMP_COST=1``) prints the features and the predicted
 device latency so it can be compared against the measured value on hardware.
 
-The standalone dump has no candidate menu and omits the menu-dependent loop-delivery
-estimate. Its looped-matmul totals can therefore differ from the allocator's objective;
-it does not reconstruct candidate divisions from the committed plan. A looped matmul's
-operand DMA requests are priced there in full, since the estimate they compose with
-(by ``max``) is absent.
+The standalone dump prices the committed division only. The loop-delivery estimate
+depends on that division alone (whether it partitions the read), so the dump charges it,
+and composes it with a looped matmul's operand DMA requests by ``max``, exactly as the
+allocator does for that division. It does not reconstruct the other candidate divisions
+from the committed plan.
 
 Extraction is best-effort and defensive: anything it can't resolve falls back to
 a safe default and never raises into compilation. The numbers must be validated
