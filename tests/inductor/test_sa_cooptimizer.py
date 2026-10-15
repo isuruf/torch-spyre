@@ -23,7 +23,7 @@ The two gates the engine must pass:
   keep-best guarantee.
 
 Plus the engine's output contract: every buffer gets a ``chosen_division`` and an
-``address`` (``None`` == spilled), with ``spill_reasons`` populated for the
+``address`` (``None`` == spilled), with a ``spill_reason`` on the
 misses. Runs over the real-shaped captured graphs at several capacities, so
 residency pressure (spills / eligibility toggles) is actually exercised.
 """
@@ -57,10 +57,8 @@ from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _one_axis_apart,
     _table_relation,
 )
+from torch_spyre._C import NativePermutationLayoutSolver
 from torch_spyre._inductor.wsr.enumerate_tilings import TilingSpace
-from torch_spyre._inductor.scratchpad.permutation_layout import (
-    make_permutation_packer,
-)
 
 from cooptimization_capture_loader import load_captures
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -142,7 +140,6 @@ def _primed(buffers, capacity):
     can drive the move / snapshot machinery -- or read the seed score -- directly.
     """
     solver = SaCoOptimizingSolver(buffers, capacity, 128)
-    solver.spill_reasons = {}
     solver._rng = rnd.Random(0)
     solver._precompute_topology()
     solver.chosen = solver._seed_configs()
@@ -236,9 +233,9 @@ class OutputContractTest(TestCase):
                     # A spilled buffer (no address) must carry a spill reason;
                     # a resident one must not.
                     if b.address is None:
-                        self.assertIn(b.name, solver.spill_reasons, f"{tag} {b.name}")
+                        self.assertIsNotNone(b.spill_reason, f"{tag} {b.name}")
                     else:
-                        self.assertNotIn(b.name, solver.spill_reasons, tag)
+                        self.assertIsNone(b.spill_reason, tag)
 
     def test_empty_graph(self):
         solver = SaCoOptimizingSolver([], 1024, 128)
@@ -473,7 +470,7 @@ class UnsizedBufferTest(TestCase):
         # The pin is spilled under its own reason, and never occupies a slot the
         # sized buffer would then be stacked on top of.
         self.assertIsNone(out["unsized"].address)
-        self.assertEqual(solver.spill_reasons["unsized"], "op not allowed")
+        self.assertEqual(out["unsized"].spill_reason, "op not allowed")
         self.assertEqual(out["sized"].address, 0)
 
 
@@ -487,7 +484,7 @@ class DeterminismTest(TestCase):
             [b.chosen_division for b in out],
             [b.address for b in out],
             solver.best_score,
-            dict(solver.spill_reasons),
+            [b.spill_reason for b in out],
         )
 
     def test_repeated_solves_are_bit_identical(self):
@@ -1057,12 +1054,12 @@ class ReorderSweepTest(TestCase):
                 # And the incrementally-maintained placement must match a
                 # from-scratch rebuild on the permutation it ended up with.
                 sizes = [s._per_core_size(i, s.chosen[i]) for i in range(len(s._bufs))]
-                fresh = make_permutation_packer(
+                fresh = NativePermutationLayoutSolver(
                     s._lifetime_buffers(sizes),
                     list(s.packer.permutation),
                     s.limit,
                     s.alignment,
-                    eligible=[s._eligible(i) for i in range(len(s._bufs))],
+                    [s._eligible(i) for i in range(len(s._bufs))],
                 )
                 self.assertEqual(list(fresh.addresses), list(s.packer.addresses), tag)
                 self.assertEqual(fresh.quality(), s.packer.quality(), tag)
