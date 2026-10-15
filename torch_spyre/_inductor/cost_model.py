@@ -1649,7 +1649,7 @@ def _loop_repeated_read_excess_ns(ops: list, p: "CostParams"):
             continue
         for arg in op.args:
             lf = getattr(arg, "loop_factor", 1) or 1
-            if arg.role != "input" or arg.broadcast or (not _is_sym(lf) and lf <= 1):
+            if arg.role != "input" or arg.broadcast:
                 continue
             is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
             total += arg.elems * (lf - 1) * op.dtype_bytes * (1 - is_lx) * per_byte
