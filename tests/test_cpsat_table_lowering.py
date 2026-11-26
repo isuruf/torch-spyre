@@ -286,8 +286,13 @@ def test_the_lowering_is_a_sympy_printer_dispatching_on_the_sympy_class():
     constant = printer.print(number).table(CAP)
     assert constant.index == UNIT
     assert printer.emptyPrinter(sympy.log(a)) is None
-    assert printer._print_Add(number) is None
-    assert printer._print_Mul(a * sympy.log(a)) is None
+    summed = printer._print_Add(number)
+    assert summed.index == UNIT and list(summed.values) == [float(number)]
+    product = printer._print_Mul(a * sympy.log(a))
+    assert product.index == position
+    assert list(product.values) == pytest.approx(
+        [0.0, 2 * math.log(2), 4 * math.log(4)]
+    )
     root = printer.print(sympy.log(a) + dummy)
     assert root is printer.print(sympy.log(a) + dummy)
     assert not hasattr(printer, "lower")  # print is the entry point

@@ -34,6 +34,7 @@ class the core has no function for is refused. Nothing imports the module yet.
 
 from __future__ import annotations
 
+import functools
 import math
 import sys
 from abc import ABC, abstractmethod
@@ -47,7 +48,7 @@ from ortools.sat.python import cp_model
 from sympy.logic.boolalg import Boolean
 from sympy.printing.printer import Printer
 
-from torch_spyre._inductor.scratchpad.cost_expr_numpy import numpy_eval
+from torch_spyre._inductor.scratchpad.cost_expr_numpy import _piecewise, numpy_eval
 
 # One cost unit is COST_SCALE objective units: a table entry is
 # rint(COST_SCALE * value).
@@ -420,7 +421,7 @@ class TableLowering(Printer):
         one rounding. A symbolic operand, as sqrt(2) * (a + b) is (sympy distributes
         only a number), stays one term."""
         if not expr.free_symbols:
-            return None
+            return TableRealization(values=[_constant(expr)], index=UNIT)
         operands = [self._print(operand) for operand in expr.args]
         constant = 0.0
         lists: dict[Index, TableRealization] = {}
@@ -444,13 +445,14 @@ class TableLowering(Printer):
 
     def _print_Mul(self, expr: sympy.Mul) -> AbstractRealization | None:
         """A quotient is one table (_quotient). A constant times one operand is the
-        operand scaled in float. Any other product is declined."""
+        operand scaled in float. Any other product is one table, the product of its
+        factors' lists."""
         if any(_divides(factor) for factor in expr.args):
             return self._quotient(expr)
         constants = [factor for factor in expr.args if not factor.free_symbols]
         operands = [factor for factor in expr.args if factor.free_symbols]
         if len(operands) != 1:
-            return None
+            return self._operation(expr, expr.args, math.prod)
         coefficient = math.prod(float(self._table(c).values[0]) for c in constants)
         return self._print(operands[0]).scaled(coefficient)
 
@@ -479,24 +481,31 @@ class TableLowering(Printer):
 
     def _print_Piecewise(self, expr: sympy.Piecewise) -> AbstractRealization:
         """Over its arms' values and conditions: an ExprCondPair is not printed."""
-        return self._operation(expr, [part for pair in expr.args for part in pair.args])
+        parts = [part for pair in expr.args for part in pair.args]
+        return self._operation(expr, parts, lambda values: _piecewise(*values))
 
     def emptyPrinter(self, expr: sympy.Basic) -> None:
         """Any other node is declined. sympy's own returns str(expr)."""
         return None
 
     def _operation(
-        self, expr: sympy.Basic, operands: Sequence[sympy.Basic]
+        self,
+        expr: sympy.Basic,
+        operands: Sequence[sympy.Basic],
+        func: Callable[[list[np.ndarray]], Any] | None = None,
     ) -> TableRealization:
         """expr as one table over its inputs, in symbol order. An operation on numbers
         is computed the same way, on UNIT, so sqrt(19) equals sqrt(a) at a = 19 (sympy's
         float is one double below). The cap is checked before any operand is printed,
-        so nothing under a refused node is evaluated."""
+        so nothing under a refused node is evaluated. func computes the values from
+        the operands' lists; numpy_eval of expr when not given."""
         if not operands:
             return TableRealization(values=[_constant(expr)], index=UNIT)
         index, grid = self._position(expr)
         arguments = [_on(self._table(operand), index, grid) for operand in operands]
-        values = _values(expr, index.size, lambda: numpy_eval(expr, arguments))
+        if func is None:
+            func = functools.partial(numpy_eval, expr)
+        values = _values(expr, index.size, lambda: func(arguments))
         return TableRealization(values=values, index=index)
 
     def _position(self, expr: sympy.Basic) -> tuple[Index, dict[Index, np.ndarray]]:
